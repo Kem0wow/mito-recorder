@@ -1,0 +1,39 @@
+name: build-exe
+on: [push, workflow_dispatch]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pyinstaller pytest
+      - run: pytest -q test_recorder.py
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name MitoRecorder
+          --collect-all faster_whisper --collect-all ctranslate2 --collect-all av
+          --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32
+          recorder.py
+      - name: English speech sample (Windows SAPI)
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Speech
+          $s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $s.SetOutputToWaveFile("$pwd\speech.wav")
+          $s.Speak("I see a door on the left, so I will open it. Next I need to find the key.")
+          $s.Dispose()
+      - name: Selftest the built exe (capture + encode + whisper + dataset)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\MitoRecorder.exe -ArgumentList "--selftest","st","--audio","speech.wav","--expect","door,key" -Wait -PassThru
+          Get-Content "$env:USERPROFILE\MitoRecorder.log"
+          if (Test-Path st\sft.jsonl) { Get-Content st\sft.jsonl }
+          exit $p.ExitCode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MitoRecorder
+          path: dist/MitoRecorder.exe
