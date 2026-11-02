@@ -11,12 +11,14 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt pyinstaller pytest
+      - run: pip install --no-deps windows-capture  # its opencv dependency is unused, kept out of the exe
       - run: pytest -q test_recorder.py
       - name: Build exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name MitoRecorder
           --collect-all faster_whisper --collect-all ctranslate2 --collect-all av
           --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32
+          --hidden-import windows_capture --exclude-module cv2
           recorder.py
       - name: English speech sample (Windows SAPI)
         shell: powershell

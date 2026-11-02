@@ -19,6 +19,7 @@ import shutil
 import sys
 import threading
 import time
+import types
 import wave
 from pathlib import Path
 
@@ -139,17 +140,25 @@ def sft_record(it):
 def list_monitors():
     with mss_cls()() as s:
         mons = s.monitors
-    return [(f"Monitor {i} ({m['width']}x{m['height']})", m) for i, m in enumerate(mons) if i] + \
-           [(f"All monitors ({mons[0]['width']}x{mons[0]['height']})", mons[0])]
+    return [(f"Monitor {i} ({m['width']}x{m['height']})", (i, m)) for i, m in enumerate(mons) if i] + \
+           [(f"All monitors ({mons[0]['width']}x{mons[0]['height']})", (0, mons[0]))]
 
 
 def window_rect(hwnd):
-    from ctypes import byref, wintypes
-    r, p = wintypes.RECT(), wintypes.POINT(0, 0)
-    u = ctypes.windll.user32
-    if not u.GetClientRect(hwnd, byref(r)) or not u.ClientToScreen(hwnd, byref(p)):
+    """Visible window bounds (what Windows Graphics Capture records), in physical px."""
+    from ctypes import byref, sizeof, wintypes
+    r = wintypes.RECT()
+    if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, byref(r), sizeof(r)) and \
+            not ctypes.windll.user32.GetWindowRect(hwnd, byref(r)):  # 9 = DWMWA_EXTENDED_FRAME_BOUNDS
         return None
-    return {"left": p.x, "top": p.y, "width": r.right, "height": r.bottom}
+    return {"left": r.left, "top": r.top, "width": r.right - r.left, "height": r.bottom - r.top}
+
+
+def is_cloaked(hwnd):  # hidden UWP/background windows report visible but are not on screen
+    from ctypes import byref, c_int, sizeof
+    v = c_int(0)
+    ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 14, byref(v), sizeof(v))
+    return v.value != 0
 
 
 def list_windows():
@@ -160,7 +169,7 @@ def list_windows():
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def cb(h, _):
-        if u.IsWindowVisible(h) and u.GetWindowTextLengthW(h):
+        if u.IsWindowVisible(h) and u.GetWindowTextLengthW(h) and not is_cloaked(h):
             buf = ctypes.create_unicode_buffer(512)
             u.GetWindowTextW(h, buf, 512)
             r = window_rect(h)
@@ -190,8 +199,10 @@ def key_name(key):
 # ---------------------------------------------------------------- recorder
 
 class Recorder:
-    def __init__(self, out, fps, region_fn, mic=None, audio=True, inputs=True):
+    def __init__(self, out, fps, region_fn, target=None, mic=None, audio=True, inputs=True):
+        """target: ("window", hwnd) | ("monitor", 1-based index) for Windows Graphics Capture; None = GDI/mss."""
         self.out, self.fps, self.region_fn, self.mic = Path(out), fps, region_fn, mic
+        self.target, self.backend = target, None
         self.audio, self.inputs_on = audio, inputs
         self.stop_ev = threading.Event()
         self.q = queue.Queue(maxsize=90)  # ~3 s of frames; full => drop, never stall capture
@@ -236,40 +247,86 @@ class Recorder:
         meta = {"started": self.started, "duration_s": round(dur, 3), "fps_requested": self.fps,
                 "fps_actual": round(self.frames / dur, 2) if dur else 0, "frames": self.frames,
                 "dropped": self.dropped, "region": self.region, "audio_t0": self.audio_t0,
+                "capture": self.backend,
                 "coords": "inputs.jsonl: absolute screen px; segments/sft: 0-1000 relative to region",
                 "error": self.error}
         (self.out / "meta.json").write_text(json.dumps(meta, indent=1))
         return meta
 
     # threads
+    def _wgc(self):
+        """Windows Graphics Capture: any window (DirectX/OpenGL/Vulkan, covered by other windows) or monitor."""
+        sys.modules.setdefault("cv2", types.ModuleType("cv2"))  # cv2 only backs save_as_image; skip ~40 MB
+        from windows_capture import WindowsCapture
+        kind, val = self.target
+        latest, got = [None], threading.Event()
+        for border in (False, None):  # border toggle unsupported on older Windows 10
+            try:
+                cap = WindowsCapture(cursor_capture=True, draw_border=border,
+                                     minimum_update_interval=max(1, int(500 / self.fps)),
+                                     **({"window_hwnd": val} if kind == "window" else {"monitor_index": val}))
+
+                @cap.event
+                def on_frame_arrived(frame, _ctl):
+                    latest[0] = (frame.frame_buffer.tobytes(), (frame.width, frame.height))
+                    got.set()
+
+                @cap.event
+                def on_closed():
+                    log("capture target closed")
+
+                ctl = cap.start_free_threaded()
+                break
+            except Exception:
+                if border is None:
+                    raise
+        if not got.wait(3):
+            ctl.stop()
+            raise RuntimeError("no frames within 3 s")
+        return (lambda: latest[0]), ctl.stop
+
+    def _mss(self):
+        sct, region, last = mss_cls()(), dict(self.region), [time.perf_counter()]
+
+        def grab():
+            if time.perf_counter() - last[0] > 1:  # follow a moved window, size stays fixed
+                last[0], r = time.perf_counter(), self.region_fn()
+                if r and r["width"] > 0:
+                    region.update(left=r["left"], top=r["top"])
+            shot = sct.grab(region)
+            return shot.bgra, shot.size
+        return grab, sct.close
+
     def _capture(self):
-        period, region = 1 / self.fps, dict(self.region)
-        nxt = last_ref = time.perf_counter()
+        period, close = 1 / self.fps, None
         try:
-            with mss_cls()() as sct:
-                while not self.stop_ev.is_set():
-                    now = time.perf_counter()
-                    if now < nxt:
-                        time.sleep(min(nxt - now, 0.05))
-                        continue
-                    nxt = nxt + period if nxt + period > now else now + period  # behind => skip, don't burst
-                    if now - last_ref > 1:  # follow a moved window, size stays fixed
-                        last_ref, r = now, self.region_fn()
-                        if r and r["width"] > 0:
-                            region.update(left=r["left"], top=r["top"])
-                    try:
-                        shot = sct.grab(region)
-                    except Exception:
-                        self.dropped += 1
-                        continue
-                    try:
-                        self.q.put_nowait((self.t(), shot.bgra, shot.size))
-                    except queue.Full:
-                        self.dropped += 1
+            if IS_WIN and self.target and self.target[1]:
+                try:
+                    grab, close = self._wgc()
+                    self.backend = "wgc"
+                except Exception as e:
+                    log(f"Windows Graphics Capture unavailable ({e}); using GDI")
+            if not close:
+                grab, close = self._mss()
+                self.backend = "gdi"
+            nxt = time.perf_counter()
+            while not self.stop_ev.is_set():
+                now = time.perf_counter()
+                if now < nxt:
+                    time.sleep(min(nxt - now, 0.05))
+                    continue
+                nxt = nxt + period if nxt + period > now else now + period  # behind => skip, don't burst
+                try:
+                    buf, size = grab()  # WGC: latest frame; unchanged screen repeats it (constant fps)
+                    self.q.put_nowait((self.t(), buf, size))
+                except Exception:
+                    self.dropped += 1
         except Exception as e:
             self.error = f"capture: {e}"
             log(self.error)
         finally:
+            if close:
+                close()
             self.q.put(None)
 
     def _encode(self):
@@ -287,11 +344,10 @@ class Recorder:
             wr = csv.writer(f)
             wr.writerow(["frame", "t"])
             while (item := self.q.get()) is not None:
-                t, buf, size = item
-                if tuple(size) != (w, h):  # DPI/size glitch: skip rather than crash
-                    self.dropped += 1
-                    continue
-                fr = av.VideoFrame.from_ndarray(np.frombuffer(buf, np.uint8).reshape(h, w, 4), format="bgra")
+                t, buf, (fw, fh) = item
+                fr = av.VideoFrame.from_ndarray(np.frombuffer(buf, np.uint8).reshape(fh, fw, 4), format="bgra")
+                if (fw, fh) != (w, h):  # window resized: scale to the fixed video size
+                    fr = fr.reformat(width=w, height=h)
                 fr.pts = self.frames
                 c.mux(st.encode(fr))
                 wr.writerow([self.frames, f"{t:.4f}"])
@@ -526,11 +582,14 @@ class App:
             messagebox.showerror("Mito Recorder", f"{out} already exists. Choose another name.")
             return
         tgt = self.targets[i][1]
-        region_fn = (lambda: tgt) if self.src.get() == "screen" else (lambda: window_rect(tgt))
+        if self.src.get() == "screen":
+            region_fn, target = (lambda: tgt[1]), ("monitor", tgt[0])
+        else:
+            region_fn, target = (lambda: window_rect(tgt)), ("window", tgt)
         mic = self.mics[self.mic.current()][1] if self.mics and self.mic.current() >= 0 else None
         try:
             fps = max(1, min(60, int(self.fps.get())))
-            self.rec = Recorder(out, fps, region_fn, mic=mic, audio=bool(self.mics)).start()
+            self.rec = Recorder(out, fps, region_fn, target=target, mic=mic, audio=bool(self.mics)).start()
         except Exception as e:
             messagebox.showerror("Mito Recorder", str(e))
             return
@@ -570,8 +629,8 @@ def selftest(a):
     if out.exists():
         shutil.rmtree(out)
     log(f"platform={sys.platform} windows={len(list_windows())}")
-    mon = list_monitors()[0][1]
-    rec = Recorder(out, 10, lambda: mon, audio=False, inputs=False).start()
+    idx, mon = list_monitors()[0][1]
+    rec = Recorder(out, 10, lambda: mon, target=("monitor", idx), audio=False, inputs=False).start()
     time.sleep(a.seconds)
     meta = rec.stop()
     log(f"recorded {meta}")
