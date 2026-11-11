@@ -16,24 +16,14 @@ jobs:
       - name: Build exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name MitoRecorder
-          --collect-all faster_whisper --collect-all ctranslate2 --collect-all av
-          --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32
-          --hidden-import windows_capture --exclude-module cv2
+          --collect-all av --hidden-import windows_capture --hidden-import pyaudiowpatch
+          --exclude-module cv2 --exclude-module PIL --exclude-module faster_whisper
           recorder.py
-      - name: English speech sample (Windows SAPI)
-        shell: powershell
-        run: |
-          Add-Type -AssemblyName System.Speech
-          $s = New-Object System.Speech.Synthesis.SpeechSynthesizer
-          $s.SetOutputToWaveFile("$pwd\speech.wav")
-          $s.Speak("I see a door on the left, so I will open it. Next I need to find the key.")
-          $s.Dispose()
-      - name: Selftest the built exe (capture + encode + whisper + dataset)
+      - name: Selftest the built exe (capture + raw input + encode + zip)
         shell: pwsh
         run: |
-          $p = Start-Process dist\MitoRecorder.exe -ArgumentList "--selftest","st","--audio","speech.wav","--expect","door,key" -Wait -PassThru
+          $p = Start-Process dist\MitoRecorder.exe -ArgumentList "--selftest","st","--seconds","4" -Wait -PassThru
           Get-Content "$env:USERPROFILE\MitoRecorder.log"
-          if (Test-Path st\sft.jsonl) { Get-Content st\sft.jsonl }
           exit $p.ExitCode
       - uses: actions/upload-artifact@v4
         with:

@@ -1,20 +1,13 @@
 # Mito Recorder
 
-Records gameplay with your spoken thoughts (in English) and keyboard/mouse input, then builds a dataset for fine-tuning a vision-language model on how you reason.
+Records gameplay as training data for a game-playing AI. Nothing is uploaded: each run is saved as one zip on your PC.
 
-1. Run `MitoRecorder.exe`. Choose the FPS, Screen or Window, the target, the microphone, the save folder and a name.
-2. Press **Start**, or **F9** while in the game. Play and think aloud. Press **F9** again to stop.
-3. After you stop, faster-whisper (`distil-large-v3`, English) transcribes the audio and the dataset is written. The model downloads about 1.5 GB on first use. Whisper runs on the GPU if CUDA 12 is installed, otherwise on the CPU.
+1. Run `MitoRecorder.exe`, pick the **game window** (run the game in windowed or borderless mode), check the game name.
+2. **Start** (or **F9** while in the game). Play. **F9** again to stop. The zip is written automatically.
+3. Send the zips from `C:\Users\<you>\MitoData\` (one `<Game>_<N>.zip` per run) to the shared folder.
 
-Output in `<folder>/<name>/`:
+Recorded: the game window (720p max, 30 fps), all sound your PC plays (mute voice chat and music apps), and keyboard + mouse **only while the game window is focused** (F9 is never logged).
 
-- **Raw recording:** `video.mp4`, `frames.csv` (frame and time), `audio.wav` and `inputs.jsonl`.
-- **Transcript:** `transcript.jsonl` (Whisper segments with word timestamps).
-- **Labelled thoughts:** `segments.jsonl`. Each line is one thought with its frame range, its actions and its keyframes.
-- **Training file:** `sft.jsonl` in LLaMA-Factory / Qwen-VL `messages` + `images` format. Image paths are relative to the session folder.
+Inside each zip: `video.mp4`, `frames.csv`, `inputs.jsonl` (Windows Raw Input, so mouse motion works in FPS games), `game_audio.ogg` (Opus, 96 kbps), `meta.json`. All share one clock; t = 0 is Start.
 
-Reprocess a session: `MitoRecorder.exe --process <session dir>`. The log is written to `%USERPROFILE%\MitoRecorder.log`.
-
-Tips:
-- Run games in borderless windowed mode, because exclusive fullscreen can record black frames.
-- Mouse deltas come from the cursor, so games that lock the cursor (FPS games) record no aim motion.
+Log: `%USERPROFILE%\MitoRecorder.log`. Dev: `pytest test_recorder.py`; CI builds the exe and self-tests it on Windows.

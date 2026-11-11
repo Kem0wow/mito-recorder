@@ -1,52 +1,66 @@
-from recorder import build_dataset, frame_range, merge_segments, pick_frames, sft_record, summarize
+import zipfile
+
+import numpy as np
+import pytest
+
+from recorder import AudioOut, audio_pad, next_index, out_size, safe_name, vk_name, zip_session
 
 
-def test_merge_segments():
-    segs = [{"start": 0.0, "end": 1.0, "text": "I see a door."},
-            {"start": 1.3, "end": 2.0, "text": "Open it."},
-            {"start": 5.0, "end": 6.0, "text": "Key next."},
-            {"start": 6.1, "end": 6.2, "text": ""}]
-    out = merge_segments(segs)
-    assert [o["text"] for o in out] == ["I see a door. Open it.", "Key next."]
-    assert out[0]["end"] == 2.0
-    long = [{"start": i * 5.0, "end": i * 5.0 + 4.9, "text": "x"} for i in range(5)]
-    assert all(o["end"] - o["start"] <= 15 for o in merge_segments(long))
+def test_safe_name():
+    assert safe_name('Minecraft 1.20.1 - Singleplayer') == "Minecraft 1.20.1 - Singleplayer"
+    assert safe_name('a<b>:c"/d\\e|f?g*\n') == "abcdefg"
+    assert safe_name("  ...  ") == "game"
+    assert len(safe_name("x" * 200)) == 60
 
 
-def test_frame_range_edges():
-    ft = [0.0, 0.1, 0.2, 0.3]
-    assert frame_range(ft, 0.05, 0.25) == (1, 2)
-    assert frame_range(ft, 0.11, 0.12) == (2, 2)   # no frame inside: next frame
-    assert frame_range(ft, 5.0, 6.0) == (3, 3)     # after video end: last frame
-    assert frame_range([], 0, 1) is None
+def test_next_index(tmp_path):
+    assert next_index(tmp_path / "missing", "Doom") == 1
+    for n in ("Doom_1.zip", "Doom_3", "doom_7.zip.part", "Doom 2_9.zip", "Doom_x.zip"):
+        (tmp_path / n).mkdir()
+    assert next_index(tmp_path, "Doom") == 4  # .part and other games ignored
+    assert next_index(tmp_path, "Doom 2") == 10
+    assert next_index(tmp_path, "[weird] (game)") == 1  # regex/glob chars in names are safe
 
 
-def test_pick_frames():
-    assert pick_frames(3, 4) == [3, 4]
-    assert pick_frames(0, 30) == [0, 10, 20, 30]
+def test_out_size():
+    assert out_size(1920, 1080) == (1280, 720)
+    assert out_size(2560, 1080) == (1706, 720)
+    assert out_size(1281, 721) == (1278, 720)  # aspect kept, made even
+    assert out_size(801, 601) == (800, 600)  # small stays native, made even
 
 
-def test_summarize_collapses():
-    acts = [{"kind": "key_down", "key": "w"}, {"kind": "key_up", "key": "w"},
-            {"kind": "key_down", "key": "w"}, {"kind": "mouse_down", "button": "left", "x": 500, "y": 250},
-            {"kind": "scroll", "dx": 0, "dy": -1}]
-    assert summarize(acts) == "press w x2, left click at (500,250), scroll down"
-    assert summarize([{"kind": "move", "x": 1, "y": 1}]) == "move mouse"
-    assert summarize([]) == "no input"
+def test_audio_pad():
+    assert audio_pad(0, 0.5, 4800, 48000) == 19200       # first chunk at 0.5 s: 0.4 s of silence before it
+    assert audio_pad(24000, 0.6, 4800, 48000) == 0       # on time
+    assert audio_pad(24000, 0.62, 4800, 48000) == 0      # jitter under 30 ms ignored
+    assert audio_pad(24000, 5.1, 4800, 48000) == 216000  # PC was silent 4.5 s
 
 
-def test_build_dataset():
-    ft = [i / 10 for i in range(100)]  # 10 s at 10 fps
-    inputs = [{"t": 2.5, "kind": "mouse_down", "button": "left", "x": 200, "y": 150},
-              {"t": 9.5, "kind": "key_down", "key": "e"}]
-    region = {"left": 100, "top": 100, "width": 200, "height": 100}
-    items = build_dataset([{"start": 2.0, "end": 3.0, "text": "Click the door."}], ft, inputs, region)
-    it = items[0]
-    assert (it["frame_start"], it["frame_end"]) == (10, 30)  # 1 s lead
-    assert it["actions"] == [{"t": 2.5, "kind": "mouse_down", "button": "left", "x": 500, "y": 500}]
-    assert it["action_summary"] == "left click at (500,500)"
-    assert it["frames"] == [10, 17, 23, 30]
-    it["keyframes"] = ["keyframes/a.jpg"]
-    rec = sft_record(it)
-    assert rec["messages"][0]["content"].startswith("<image>") and rec["images"] == ["keyframes/a.jpg"]
-    assert "Click the door." in rec["messages"][1]["content"]
+def test_vk_name():
+    assert [vk_name(v) for v in (0x57, 0x31, 0x20, 0x70, 0x60, 0xA0, 0xFE)] == \
+        ["w", "1", "space", "f1", "num0", "shift", "vk254"]
+
+
+def test_zip_session(tmp_path):
+    d = tmp_path / "Game 1.5_2"
+    d.mkdir()
+    (d / "video.mp4").write_bytes(b"\0" * 1000)
+    (d / "inputs.jsonl").write_text('{"t": 0}\n' * 100)
+    z = zip_session(d)
+    assert z.name == "Game 1.5_2.zip" and not d.exists()
+    with zipfile.ZipFile(z) as zf:
+        info = {i.filename: i.compress_type for i in zf.infolist()}
+    assert info == {"Game 1.5_2/inputs.jsonl": zipfile.ZIP_DEFLATED, "Game 1.5_2/video.mp4": zipfile.ZIP_STORED}
+
+
+def test_audio_out_keeps_session_clock(tmp_path):
+    av = pytest.importorskip("av")
+    rate = 44100  # device rate differs from the 48 kHz file on purpose
+    out = AudioOut(tmp_path / "game_audio", rate)
+    tone = (np.sin(np.arange(4410) / 10) * 8000).astype(np.int16)
+    out.write(0.5, np.stack([tone] * 2, axis=1))           # first sound at 0.4-0.5 s
+    out.write(2.0, np.stack([tone] * 6, axis=1))           # 1.4 s silence, 6-channel device
+    out.close()
+    with av.open(str(out.path)) as c:
+        n = sum(f.samples for f in c.decode(audio=0))
+    assert abs(n / 48000 - 2.0) < 0.05, n / 48000
