@@ -8,6 +8,6 @@ Records gameplay as training data for a game-playing AI. Nothing is uploaded: ea
 
 Recorded: the game window (720p max, 30 fps), all sound your PC plays (mute voice chat and music apps), and keyboard + mouse **only while the game window is focused** (F9 is never logged).
 
-Inside each zip: `video.mp4`, `frames.csv`, `inputs.jsonl` (Windows Raw Input, so mouse motion works in FPS games), `game_audio.ogg` (Opus, 96 kbps), `meta.json`. All share one clock; t = 0 is Start.
+Inside each zip: `video.mp4` (fragmented, so a crash keeps it playable), `frames.csv` (with source-frame arrival time and a fresh/repeat flag), `inputs.jsonl` (Windows Raw Input, so mouse motion works in FPS games), `game_audio.ogg` (Opus, 96 kbps), `meta.json` (system info, your optional mouse DPI / sensitivity, a quality report with warnings). All share one clock; t = 0 is Start.
 
 Log: `%USERPROFILE%\MitoRecorder.log`. Dev: `pytest test_recorder.py`; CI builds the exe and self-tests it on Windows.

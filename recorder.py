@@ -2,10 +2,12 @@
 
 Each run becomes one zip in the save folder, named after the game: <Game>_<N>.zip, holding
   video.mp4        H.264 (x264 veryfast, CRF 23), scaled down to at most 720p, constant FPS (default 30)
-  frames.csv       frame index -> session time (s)
-  inputs.jsonl     keyboard + mouse from Windows Raw Input, logged only while the game window is focused
+  frames.csv       frame, t (grab time), src_t (source frame arrival), fresh (0 = repeat of the previous frame)
+  inputs.jsonl     keyboard + mouse from Windows Raw Input, logged only while the game window is focused,
+                   plus focus / cursor-lock / window-move events
   game_audio.ogg   what the PC plays (WASAPI loopback), Opus 96 kbps, on the session clock
-  meta.json        game, sizes, timing, versions
+  meta.json        game, sizes, timing, system (pointer speed, refresh rate), user (DPI, sensitivity),
+                   quality numbers + warnings
 Everything shares one clock: session time 0 = Start. Thoughts / dataset labelling happen later, elsewhere.
 
 CLI:  recorder.py                  -> UI
@@ -15,9 +17,11 @@ import argparse
 import csv
 import itertools
 import json
+import platform
 import queue
 import re
 import shutil
+import statistics
 import sys
 import threading
 import time
@@ -28,9 +32,11 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.0"
+VERSION = "2.1"
 IS_WIN = sys.platform == "win32"
 FPS = 30
+MIN_FREE = 3e9   # refuse to start with less free disk than this
+LOW_FREE = 5e8   # stop (and save) a running session below this
 MAX_H = 720
 X264 = {"preset": "veryfast", "crf": "23"}
 AUDIO_BPS = 96_000
@@ -85,6 +91,81 @@ def audio_pad(written, t, n, rate, tol=0.03):
     WASAPI loopback delivers nothing while the PC is silent; padding keeps audio on the session clock."""
     gap = round(t * rate) - n - written
     return gap if gap > tol * rate else 0
+
+
+def quality(dur, fps, fresh, lags, bright, events, audio_s, silent, dropped):
+    """Health numbers + human warnings for one session.
+    fresh: 0/1 per frame (1 = a new source frame); lags: s between source frame arrival and our grab (fresh frames);
+    bright: sampled mean pixel values; events: input dicts; audio_s/silent: file seconds, share of silent chunks."""
+    n, on, last, kinds = len(fresh), 0.0, None, {}
+    for e in events:
+        kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
+        if e["kind"] == "focus":
+            if e["on"]:
+                last = e["t"]
+            elif last is not None:
+                on, last = on + e["t"] - last, None
+    if last is not None:
+        on += dur - last
+    q = {"fps": round(n / dur, 2) if dur else 0, "fresh_frame_share": round(sum(fresh) / n, 3) if n else 0,
+         "capture_lag_ms_median": round(statistics.median(lags) * 1000, 1) if lags else None,
+         "black_share": round(sum(b < 3 for b in bright) / len(bright), 3) if bright else None,
+         "focused_s": round(on, 1), "input_events": kinds, "audio_s": audio_s, "audio_silent_share": silent,
+         "dropped": dropped}
+    w = []
+    if q["black_share"] and q["black_share"] > 0.5:
+        w.append("video is mostly black: run the game in windowed or borderless mode")
+    if dur and q["fps"] < 0.9 * fps:
+        w.append(f"only {q['fps']} fps (target {fps}): close other programs or lower the game's graphics")
+    if dropped > 0.01 * max(n, 1):
+        w.append(f"{dropped} frames dropped")
+    if audio_s is None:
+        w.append("no game audio recorded")
+    elif silent is not None and silent > 0.95:
+        w.append("game audio is silent: is the game muted?")
+    if dur > 10 and on < 0.5 * dur:
+        w.append("the game window was focused less than half of the time")
+    if dur > 10 and not any(k in kinds for k in ("key_down", "mouse_down", "move")):
+        w.append("no keyboard or mouse input recorded")
+    return q, w
+
+
+def system_info():
+    info = {"os": platform.platform()}
+    if not IS_WIN:
+        return info
+    try:
+        u, gdi = ctypes.windll.user32, ctypes.windll.gdi32
+        spd, m = ctypes.c_uint(), (ctypes.c_int * 3)()
+        u.SystemParametersInfoW(0x70, 0, ctypes.byref(spd), 0)  # SPI_GETMOUSESPEED, 1-20, 10 = default
+        u.SystemParametersInfoW(3, 0, m, 0)                       # SPI_GETMOUSE: [thr1, thr2, accel]
+        info.update(pointer_speed=spd.value, pointer_precision=bool(m[2]), system_dpi=u.GetDpiForSystem())
+        u.GetDC.restype = ctypes.c_void_p
+        u.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi.GetDeviceCaps.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        dc = u.GetDC(None)
+        info["refresh_hz"] = gdi.GetDeviceCaps(dc, 116)  # VREFRESH
+        u.ReleaseDC(None, dc)
+    except Exception as e:
+        info["error"] = repr(e)
+    return info
+
+
+def cursor_state():
+    """Cursor visible? Clipped to a region (games lock it for mouse-look)? clip=None when free."""
+    from ctypes import byref, sizeof
+    from ctypes import wintypes as W
+
+    class CI(ctypes.Structure):
+        _fields_ = [("cb", W.DWORD), ("flags", W.DWORD), ("h", W.HANDLE), ("pt", W.POINT)]
+
+    u, ci, r = ctypes.windll.user32, CI(), W.RECT()
+    ci.cb = sizeof(CI)
+    u.GetCursorInfo(byref(ci))
+    u.GetClipCursor(byref(r))
+    x, y, w, h = (u.GetSystemMetrics(i) for i in (76, 77, 78, 79))  # virtual screen
+    free = (r.left, r.top, r.right, r.bottom) == (x, y, x + w, y + h)
+    return {"visible": bool(ci.flags & 1), "clip": None if free else [r.left, r.top, r.right, r.bottom]}
 
 
 VK_NAMES = {8: "backspace", 9: "tab", 13: "enter", 16: "shift", 17: "ctrl", 18: "alt", 19: "pause",
@@ -142,14 +223,17 @@ class AudioOut:
         self.c.mux(self.st.encode(fr))
         self.written += len(a)
 
+    def pad_to(self, t, n=0):
+        pad = audio_pad(self.written, t, n, self.rate)
+        while pad > 0:
+            k = min(pad, self.rate)
+            self._put(np.zeros((k, 2), np.int16))
+            pad -= k
+
     def write(self, t, a):
         """a: int16 (n, channels) that ended at session time t. Keeps the first two channels."""
         a = a[:, :2] if a.shape[1] >= 2 else np.repeat(a, 2, axis=1)
-        pad = audio_pad(self.written, t, len(a), self.rate)
-        while pad > 0:
-            n = min(pad, self.rate)
-            self._put(np.zeros((n, 2), np.int16))
-            pad -= n
+        self.pad_to(t, len(a))
         self._put(a)
 
     def close(self):
@@ -276,17 +360,18 @@ class RawInput:
             self.ready.set()
             return
         self.ready.set()
-        msg, raw, size, pt, acc = W.MSG(), RAW(), W.UINT(), W.POINT(), [0, 0]
+        msg, raw, size, pt, acc, t0m = W.MSG(), RAW(), W.UINT(), W.POINT(), [0, 0], [None]
 
         def cursor():
             u.GetCursorPos(byref(pt))
             return pt.x, pt.y
 
-        def flush():
+        def flush():  # "pc" = perf_counter of the slice's first count, so motion is stamped when it began
             if acc[0] or acc[1]:
                 x, y = cursor()
-                self.handler({"kind": "move", "dx": acc[0], "dy": acc[1], "x": x, "y": y})
+                self.handler({"kind": "move", "dx": acc[0], "dy": acc[1], "x": x, "y": y, "pc": t0m[0]})
                 acc[0] = acc[1] = 0
+            t0m[0] = None
 
         while u.GetMessageW(byref(msg), None, 0, 0) > 0:
             try:
@@ -297,6 +382,8 @@ class RawInput:
                         if raw.hdr.type == 0:
                             m = raw.d.m
                             if not m.flags & 1:  # relative motion (absolute = tablet / remote desktop)
+                                if t0m[0] is None:
+                                    t0m[0] = time.perf_counter()
                                 acc[0] += m.dx
                                 acc[1] += m.dy
                             bf, bd = m.buttons & 0xFFFF, m.buttons >> 16 & 0xFFFF
@@ -306,14 +393,16 @@ class RawInput:
                                 for bit, (name, down) in BUTTONS.items():
                                     if bf & bit:
                                         self.handler({"kind": "mouse_down" if down else "mouse_up",
-                                                      "button": name, "x": x, "y": y})
+                                                      "button": name, "x": x, "y": y, "pc": time.perf_counter()})
                                 for bit, axis in ((0x400, "dy"), (0x800, "dx")):  # 120 = one wheel notch
                                     if bf & bit:
-                                        self.handler({"kind": "scroll", axis: (bd ^ 0x8000) - 0x8000, "x": x, "y": y})
+                                        self.handler({"kind": "scroll", axis: (bd ^ 0x8000) - 0x8000, "x": x, "y": y,
+                                                      "pc": time.perf_counter()})
                         elif raw.hdr.type == 1 and raw.d.k.vk != 255:
                             k = raw.d.k
                             self.handler({"kind": "key_up" if k.flags & 1 else "key_down", "key": vk_name(k.vk),
-                                          "vk": k.vk, "sc": k.sc | (0xE000 if k.flags & 2 else 0)})
+                                          "vk": k.vk, "sc": k.sc | (0xE000 if k.flags & 2 else 0),
+                                          "pc": time.perf_counter()})
                 elif msg.message == 0x0113:  # WM_TIMER
                     flush()
             except Exception as e:
@@ -325,7 +414,7 @@ class RawInput:
 # ---------------------------------------------------------------- recorder
 
 class Recorder:
-    def __init__(self, out, fps, region_fn, target=None, hwnd=None, game="", title="", audio=True):
+    def __init__(self, out, fps, region_fn, target=None, hwnd=None, game="", title="", audio=True, user=None):
         """target: ("window", hwnd) | ("monitor", 1-based index) for Windows Graphics Capture; None = GDI/mss.
         hwnd: inputs are kept only while this window is in the foreground (None = always)."""
         self.out, self.fps, self.region_fn = Path(out), fps, region_fn
@@ -334,7 +423,9 @@ class Recorder:
         self.stop_ev, self.lock = threading.Event(), threading.Lock()
         self.q = queue.Queue(maxsize=fps)  # ~1 s of frames; full => drop, never stall capture
         self.frames = self.dropped = 0
-        self.inputs, self.down, self.focus, self.threads = [], {}, None, []
+        self.user, self.sysinfo, self.note = user or {}, system_info(), None
+        self.down, self.focus, self.threads, self.fh = {}, None, [], None
+        self.fresh, self.lags, self.bright, self.cstate, self.audio_stats = [], [], [], None, None
 
     def t(self):
         return time.perf_counter() - self.t0
@@ -346,6 +437,11 @@ class Recorder:
         self.region = {k: r[k] for k in ("left", "top", "width", "height")}
         self.vsize = out_size(r["width"], r["height"])
         self.out.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(self.out).free < MIN_FREE:
+            self.out.rmdir()
+            raise RuntimeError(f"less than {MIN_FREE / 1e9:.0f} GB free on that drive: pick another save folder")
+        self.fh = open(self.out / "inputs.jsonl", "w", encoding="utf-8")  # streamed: a crash keeps the log
+        self.region_now = dict(self.region)
         self.started = time.strftime("%Y-%m-%dT%H:%M:%S")
         self.t0 = time.perf_counter()
         workers = [self._capture, self._encode] + ([self._game_audio] if self.audio and IS_WIN else [])
@@ -359,9 +455,17 @@ class Recorder:
         for th in self.threads:
             th.join()
         dur = self.t()
-        self.inputs.sort(key=lambda e: e["t"])
-        with open(self.out / "inputs.jsonl", "w", encoding="utf-8") as f:
-            f.writelines(json.dumps(e) + "\n" for e in self.inputs)
+        with self.lock:
+            self.fh.close()
+        p = self.out / "inputs.jsonl"
+        events = sorted((json.loads(x) for x in open(p, encoding="utf-8")), key=lambda e: e["t"])
+        p.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+        q, warnings = quality(dur, self.fps, self.fresh, self.lags, self.bright, events,
+                              *(self.audio_stats or (None, None)), self.dropped)
+        if self.audio_error:
+            warnings = [w for w in warnings if w != "no game audio recorded"] + [f"game audio failed: {self.audio_error}"]
+        if self.note:
+            warnings.append(self.note)
         meta = {"recorder": VERSION, "game": self.game, "window_title": self.title, "started": self.started,
                 "duration_s": round(dur, 3), "fps_requested": self.fps,
                 "fps_actual": round(self.frames / dur, 2) if dur else 0, "frames": self.frames,
@@ -370,15 +474,24 @@ class Recorder:
                 "audio_error": self.audio_error,
                 "inputs": "Windows Raw Input, only while the game window is focused. t = session s. "
                           "x/y = absolute screen px (see region). move dx/dy = raw mouse counts summed over "
-                          "~16 ms. scroll 120 = one notch. vk/sc = Windows virtual-key / scan code.",
-                "error": self.error}
+                          "~16 ms, stamped when the motion began. scroll 120 = one notch. vk/sc = Windows "
+                          "virtual-key / scan code. Sorted by t. cursor events: visible + clip (clip set = cursor "
+                          "locked to a region, i.e. mouse-look). region events: window moved/resized. focus: game "
+                          "window gained/lost focus (keys still held are released with forced=true).",
+                "error": self.error, "user": self.user, "system": self.sysinfo, "quality": q, "warnings": warnings}
         (self.out / "meta.json").write_text(json.dumps(meta, indent=1))
         return meta
 
     # input (Raw Input thread)
+    def _log(self, t, ev):  # caller holds self.lock
+        if not self.fh.closed:
+            self.fh.write(json.dumps({"t": round(max(t, 0.0), 4), **ev}) + "\n")
+
     def on_raw(self, ev):
         if not self.focus:
             return
+        pc = ev.pop("pc", None)
+        t = pc - self.t0 if pc is not None else self.t()
         kind = ev["kind"]
         with self.lock:
             if kind in ("key_down", "key_up"):
@@ -389,16 +502,33 @@ class Recorder:
                     self.down[kid] = ev
                 else:
                     del self.down[kid]
-            self.inputs.append({"t": round(self.t(), 4), **ev})
+            self._log(t, ev)
 
     def _set_focus(self, f):
         with self.lock:
-            t = round(self.t(), 4)
-            self.inputs.append({"t": t, "kind": "focus", "on": f})
+            t = self.t()
+            self._log(t, {"kind": "focus", "on": f})
             if not f:  # keys held while alt-tabbing out would never see their key_up
-                self.inputs.extend({"t": t, **ev, "kind": "key_up", "forced": True} for ev in self.down.values())
+                for ev in self.down.values():
+                    self._log(t, {**ev, "kind": "key_up", "forced": True})
                 self.down.clear()
             self.focus = f
+
+    def _watch(self):
+        """Twice a second: log cursor lock/visibility and window moves, flush the input log to disk."""
+        with self.lock:
+            if IS_WIN:
+                s = cursor_state()
+                if s != self.cstate:
+                    self.cstate = s
+                    self._log(self.t(), {"kind": "cursor", **s})
+            if self.target and self.target[0] == "window":
+                r = self.region_fn()
+                r = {k: r[k] for k in ("left", "top", "width", "height")} if r else None
+                if r and r != self.region_now:
+                    self.region_now = r
+                    self._log(self.t(), {"kind": "region", **r})
+            self.fh.flush()
 
     # threads
     def _wgc(self):
@@ -406,7 +536,7 @@ class Recorder:
         sys.modules.setdefault("cv2", types.ModuleType("cv2"))  # cv2 only backs save_as_image; skip ~40 MB
         from windows_capture import WindowsCapture
         kind, val = self.target
-        latest, got = [None], threading.Event()
+        latest, got, seq = [None], threading.Event(), itertools.count(1)
         for border in (False, None):  # border toggle unsupported on older Windows 10
             try:
                 cap = WindowsCapture(cursor_capture=True, draw_border=border,
@@ -415,7 +545,8 @@ class Recorder:
 
                 @cap.event
                 def on_frame_arrived(frame, _ctl):
-                    latest[0] = frame.frame_buffer.copy()  # BGRA (h, w, 4); buffer is only valid in here
+                    # (BGRA (h, w, 4) copy: the buffer is only valid in here, frame id, arrival session time)
+                    latest[0] = (frame.frame_buffer.copy(), next(seq), self.t())
                     got.set()
 
                 @cap.event
@@ -441,7 +572,7 @@ class Recorder:
                 if r and r["width"] > 0:
                     region.update(left=r["left"], top=r["top"])
             shot = sct.grab(region)
-            return np.frombuffer(shot.bgra, np.uint8).reshape(shot.height, shot.width, 4)
+            return np.frombuffer(shot.bgra, np.uint8).reshape(shot.height, shot.width, 4), None, self.t()
         return grab, sct.close
 
     def _capture(self):
@@ -457,7 +588,7 @@ class Recorder:
             if not close:
                 grab, close = self._mss()
                 self.backend = "gdi"
-            black = None
+            black, last_seq, last_watch = None, None, -1.0
             nxt = time.perf_counter()
             while not self.stop_ev.is_set():
                 now = time.perf_counter()
@@ -468,14 +599,18 @@ class Recorder:
                 f = self.hwnd is None or u.GetForegroundWindow() == self.hwnd
                 if f != self.focus:
                     self._set_focus(f)
+                if now - last_watch >= 0.5:
+                    last_watch = now
+                    self._watch()
                 try:
                     if self.backend == "gdi" and not f:  # GDI films whatever covers the game: never record that
                         if black is None:
                             black = np.zeros((self.region["height"], self.region["width"], 4), np.uint8)
-                        img = black
+                        img, seq, src_t = black, -1, self.t()
                     else:
-                        img = grab()  # WGC: latest frame; unchanged screen repeats it (constant fps)
-                    self.q.put_nowait((self.t(), img))
+                        img, seq, src_t = grab()  # WGC: latest frame; unchanged screen repeats it (constant fps)
+                    fresh, last_seq = seq is None or seq != last_seq, seq
+                    self.q.put_nowait((self.t(), img, src_t, int(fresh)))
                 except Exception:
                     self.dropped += 1
         except Exception as e:
@@ -489,7 +624,9 @@ class Recorder:
     def _encode(self):
         import av
         w, h = self.vsize
-        with av.open(str(self.out / "video.mp4"), "w") as c, \
+        # fragmented mp4: a crash or power loss leaves a playable file
+        with av.open(str(self.out / "video.mp4"), "w",
+                     options={"movflags": "frag_keyframe+empty_moov+default_base_moof"}) as c, \
                 open(self.out / "frames.csv", "w", newline="") as f:
             try:  # GOP 2 s: cheap random access when sampling frames for training
                 st = c.add_stream("libx264", rate=self.fps, options={**X264, "g": str(self.fps * 2)})
@@ -498,22 +635,29 @@ class Recorder:
                 st.bit_rate = 6_000_000
             st.width, st.height, st.pix_fmt = w, h, "yuv420p"
             wr = csv.writer(f)
-            wr.writerow(["frame", "t"])
+            # t = session time we grabbed the frame; src_t = when the source frame arrived; fresh = 0 if repeated
+            wr.writerow(["frame", "t", "src_t", "fresh"])
             while (item := self.q.get()) is not None:
-                t, img = item
+                t, img, src_t, fresh = item
                 # one swscale pass: BGRA -> yuv420p at <=720p; AREA keeps small UI text readable
                 fr = av.VideoFrame.from_ndarray(img, format="bgra").reformat(
                     width=w, height=h, format="yuv420p", interpolation="AREA")
                 fr.pts = self.frames
                 c.mux(st.encode(fr))
-                wr.writerow([self.frames, f"{t:.4f}"])
+                wr.writerow([self.frames, f"{t:.4f}", f"{src_t:.4f}", fresh])
+                self.fresh.append(fresh)
+                if fresh:
+                    self.lags.append(t - src_t)
+                if self.frames % 30 == 0:
+                    self.bright.append(float(img[::16, ::16, :3].mean()))
+                    f.flush()
                 self.frames += 1
             c.mux(st.encode())
 
     def _game_audio(self):
         # ponytail: whole-PC loopback (voice chat leaks in). Per-process capture needs Win10 2004+
         # ActivateAudioInterfaceAsync(PROCESS_LOOPBACK); add if friends can't mute voice chat.
-        out = None
+        out, stats = None, [0, 0]  # chunks, silent chunks
         try:
             import pyaudiowpatch as pa
             p = pa.PyAudio()
@@ -539,7 +683,10 @@ class Recorder:
                             t, data, n = q.get(timeout=0.2) if block else q.get_nowait()
                         except queue.Empty:
                             return
-                        out.write(t, np.frombuffer(data, np.int16).reshape(n, ch))
+                        a = np.frombuffer(data, np.int16).reshape(n, ch)
+                        stats[0] += 1
+                        stats[1] += int(a.min() > -8 and a.max() < 8)
+                        out.write(t, a)
 
                 while not self.stop_ev.is_set():
                     drain(True)
@@ -553,7 +700,9 @@ class Recorder:
             log(f"game audio: {self.audio_error}")
         finally:
             if out:
+                out.pad_to(self.t())  # trailing silence: the file ends with the session
                 out.close()
+                self.audio_stats = (round(out.written / out.rate, 2), round(stats[1] / max(stats[0], 1), 3))
 
 
 # ---------------------------------------------------------------- UI
@@ -566,6 +715,7 @@ class App:
         root.title("Mito Recorder")
         root.resizable(False, False)
         self.fps, self.game = tk.IntVar(value=FPS), tk.StringVar()
+        self.dpi, self.sens = tk.StringVar(), tk.StringVar()
         self.out = tk.StringVar(value=str(Path.home() / "MitoData"))
         self.status = tk.StringVar(value="Pick the game window, then press Start (or F9 in game).")
         self.rec, self.raw, self.busy, self.toggle_req, self.msg, self.f9 = None, None, False, False, None, False
@@ -584,6 +734,8 @@ class App:
         line("Game window", self.target, ttk.Button(f, text="Refresh", command=self.refresh))
         line("Game name", ttk.Entry(f, textvariable=self.game, width=58))
         line("FPS", ttk.Spinbox(f, from_=1, to=60, textvariable=self.fps, width=6))
+        line("Mouse DPI (optional)", ttk.Entry(f, textvariable=self.dpi, width=10))
+        line("Game sensitivity (optional)", ttk.Entry(f, textvariable=self.sens, width=10))
         line("Save to", ttk.Entry(f, textvariable=self.out, width=58), ttk.Button(f, text="Browse", command=self.browse))
         self.btn = ttk.Button(f, text="Start (F9)", command=self.toggle)
         self.btn.grid(row=next(row), column=0, columnspan=3, sticky="we", pady=8)
@@ -651,7 +803,9 @@ class App:
         try:
             fps = max(1, min(60, int(self.fps.get())))
             self.rec = Recorder(d, fps, lambda: window_rect(hwnd), target=("window", hwnd), hwnd=hwnd,
-                                game=game, title=title).start()
+                                game=game, title=title,
+                                user={"mouse_dpi": self.dpi.get().strip(),
+                                      "game_sensitivity": self.sens.get().strip()}).start()
         except Exception as e:
             messagebox.showerror("Mito Recorder", str(e))
             return
@@ -663,7 +817,7 @@ class App:
             z = zip_session(rec.out)
             self.msg = (f"Saved {z.name}: {meta['duration_s'] / 60:.1f} min, {meta['fps_actual']} fps, "
                         f"{z.stat().st_size / 1e9:.2f} GB." +
-                        (f" No game audio: {meta['audio_error']}" if meta["audio_error"] else ""))
+                        (f" WARNINGS: {'; '.join(meta['warnings'])}" if meta["warnings"] else " Quality OK."))
         except Exception as e:
             log(f"save failed: {e!r}")
             self.msg = f"Save failed: {e}. Raw files are kept in {rec.out}"
@@ -687,6 +841,9 @@ class App:
         if self.msg:
             self.status.set(self.msg)
             self.msg = None
+        if self.rec and shutil.disk_usage(self.rec.out).free < LOW_FREE:
+            self.rec.note = "stopped early: the disk was almost full"
+            self.toggle()
         if self.rec:
             r, t = self.rec, self.rec.t()
             self.status.set(f"REC {int(t // 60):02d}:{int(t % 60):02d}  {r.out.name}  {r.frames / max(t, 1e-6):.1f} fps"
@@ -738,8 +895,20 @@ def selftest(a):
     log(f"recorded {json.dumps(meta)}")
     assert meta["frames"] > 0 and not meta["error"], meta
     assert meta["video_size"][1] <= MAX_H, meta["video_size"]
+    import av
+    with av.open(str(d / "video.mp4")) as c:  # the fragmented mp4 must decode completely
+        n = sum(1 for _ in c.decode(video=0))
+    assert abs(n - meta["frames"]) <= 1, (n, meta["frames"])
+    rows = list(csv.DictReader(open(d / "frames.csv")))
+    assert len(rows) == meta["frames"] and set(rows[0]) == {"frame", "t", "src_t", "fresh"}, rows[:1]
+    assert meta["quality"]["fresh_frame_share"] > 0, meta["quality"]
+    log(f"quality {json.dumps(meta['quality'])} warnings {meta['warnings']}")
     inputs = [json.loads(x) for x in open(d / "inputs.jsonl", encoding="utf-8")]
     log(f"inputs {inputs}")
+    assert all("pc" not in e for e in inputs) and [e["t"] for e in inputs] == sorted(e["t"] for e in inputs)
+    if IS_WIN:
+        assert any(e["kind"] == "cursor" for e in inputs), "cursor state missing"
+        assert meta["system"].get("pointer_speed"), meta["system"]
     if sent == 3:
         assert any(e["kind"] == "move" and (e["dx"] or e["dy"]) for e in inputs), "raw mouse move missing"
         assert any(e["kind"] == "key_down" and e["key"] == "x" for e in inputs), "raw key missing"

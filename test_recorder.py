@@ -3,7 +3,7 @@ import zipfile
 import numpy as np
 import pytest
 
-from recorder import AudioOut, audio_pad, next_index, out_size, safe_name, vk_name, zip_session
+from recorder import AudioOut, audio_pad, next_index, out_size, quality, safe_name, vk_name, zip_session
 
 
 def test_safe_name():
@@ -64,3 +64,27 @@ def test_audio_out_keeps_session_clock(tmp_path):
     with av.open(str(out.path)) as c:
         n = sum(f.samples for f in c.decode(audio=0))
     assert abs(n / 48000 - 2.0) < 0.05, n / 48000
+
+
+def test_audio_pad_to_end(tmp_path):
+    av = pytest.importorskip("av")
+    out = AudioOut(tmp_path / "a", 48000)
+    out.pad_to(3.0)  # nothing was ever played: the file still spans the session
+    out.close()
+    with av.open(str(out.path)) as c:
+        n = sum(f.samples for f in c.decode(audio=0))
+    assert abs(n / 48000 - 3.0) < 0.05
+
+
+def test_quality():
+    ev = [{"t": 0.0, "kind": "focus", "on": True}, {"t": 1.0, "kind": "key_down"}]
+    q, w = quality(60, 30, [1] * 1800, [0.01] * 1800, [40.0] * 60, ev, 60.0, 0.3, 0)
+    assert w == [] and q["focused_s"] == 60 and q["capture_lag_ms_median"] == 10.0
+    bad = [{"t": 0.0, "kind": "focus", "on": True}, {"t": 5.0, "kind": "focus", "on": False}]
+    q, w = quality(60, 30, [1] * 1000 + [0] * 100, [0.01], [0.5] * 10, bad, None, None, 50)
+    text = " | ".join(w)
+    for s in ("mostly black", "only 18.33 fps", "50 frames dropped", "no game audio", "focused less than half",
+              "no keyboard or mouse"):
+        assert s in text, (s, w)
+    _, w = quality(20, 30, [1] * 600, [0.01], [40.0], ev, 20.0, 1.0, 0)
+    assert any("silent" in x for x in w)
