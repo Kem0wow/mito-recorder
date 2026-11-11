@@ -461,7 +461,9 @@ class Recorder:
         self.region_now = dict(self.region)
         self.started = time.strftime("%Y-%m-%dT%H:%M:%S")
         self.t0 = time.perf_counter()
-        workers = [self._capture, self._encode] + ([self._game_audio] if self.audio and IS_WIN else [])
+        # focus is known from t=0, not after the capture backend finishes starting (WGC can take ~2 s)
+        self._set_focus(self.hwnd is None or ctypes.windll.user32.GetForegroundWindow() == self.hwnd)
+        workers =[self._capture, self._encode] + ([self._game_audio] if self.audio and IS_WIN else [])
         self.threads = [threading.Thread(target=f, daemon=True) for f in workers]
         for th in self.threads:
             th.start()
@@ -918,7 +920,10 @@ def selftest(a):
     idx, mon = list_monitors()[0][1]
     rec = Recorder(d, FPS, lambda: mon, target=("monitor", idx), game=game, title=game).start()
     raw = RawInput(rec.on_raw).start() if IS_WIN else None
-    time.sleep(1)
+    end = time.time() + 10
+    while rec.frames == 0 and time.time() < end:  # capture backend startup is slow on CI
+        time.sleep(0.1)
+    time.sleep(0.5)
     sent = inject_test_input() if IS_WIN else 0
     time.sleep(a.seconds)
     meta = rec.stop()
