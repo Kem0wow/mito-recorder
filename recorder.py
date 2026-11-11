@@ -17,6 +17,7 @@ import argparse
 import csv
 import itertools
 import json
+import os
 import platform
 import queue
 import re
@@ -26,13 +27,29 @@ import sys
 import threading
 import time
 import types
+import webbrowser
 import zipfile
 from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.1"
+VERSION = "2.0"
+UPLOAD_URL = "https://drive.google.com/drive/folders/1g-eHWyhihvk86EOgC-639riVl9WZGBXo?usp=sharing"
+HOWTO = ("HOW TO RECORD\n"
+         "1. Start your game in windowed or borderless mode (not exclusive fullscreen).\n"
+         "2. Pick the game window above and check the game name.\n"
+         "3. Press Start, or F9 while in the game. Play. Press F9 again to stop. The zip is saved for you.\n"
+         "4. Click \"Upload recordings\" and drop the .zip files (do not unzip them) into the Drive folder.")
+TIPS = ("TIPS FOR GOOD DATA\n"
+        "- Play seriously and normally, like you want to win or finish a level. Do not idle, pause or AFK.\n"
+        "- Sessions of 10-60 minutes are ideal. Different games and different situations help more than one long run.\n"
+        "- Keep the game window focused. When you alt-tab, nothing is recorded.\n"
+        "- Mute voice chat and music apps: all sound your PC plays is recorded. Turn off Discord/Steam overlays.\n"
+        "- Close heavy programs. If the result says low fps, lower the game's graphics or resolution.\n"
+        "- Use your normal mouse settings. If you know your mouse DPI and the game's sensitivity, enter them.\n"
+        "- After you stop, read the result line. \"Quality OK\" is good. If it shows a warning (black video, "
+        "no sound, low fps), fix it and record again.")
 IS_WIN = sys.platform == "win32"
 FPS = 30
 MIN_FREE = 3e9   # refuse to start with less free disk than this
@@ -740,8 +757,16 @@ class App:
         self.btn = ttk.Button(f, text="Start (F9)", command=self.toggle)
         self.btn.grid(row=next(row), column=0, columnspan=3, sticky="we", pady=8)
         ttk.Label(f, textvariable=self.status, wraplength=520).grid(row=next(row), column=0, columnspan=3, sticky="w")
-        ttk.Label(f, text=CONSENT, wraplength=520, foreground="#666").grid(row=next(row), column=0, columnspan=3,
-                                                                          sticky="w", pady=(8, 0))
+        bf = ttk.Frame(f)
+        bf.grid(row=next(row), column=0, columnspan=3, sticky="we", pady=(0, 6))
+        ttk.Button(bf, text="Upload recordings (Google Drive)", command=lambda: webbrowser.open(UPLOAD_URL)
+                   ).pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ttk.Button(bf, text="Open my recordings folder", command=self.open_folder
+                   ).pack(side="left", expand=True, fill="x", padx=(3, 0))
+        for txt in (HOWTO, TIPS, CONSENT):
+            ttk.Label(f, text=txt, wraplength=520, justify="left",
+                      foreground="#666" if txt is CONSENT else "").grid(row=next(row), column=0, columnspan=3,
+                                                                       sticky="w", pady=(6, 0))
         self.refresh()
         if IS_WIN:
             try:
@@ -761,6 +786,12 @@ class App:
         rec = self.rec
         if rec:
             rec.on_raw(ev)
+
+    def open_folder(self):
+        p = Path(self.out.get())
+        p.mkdir(parents=True, exist_ok=True)
+        if IS_WIN:
+            os.startfile(p)
 
     def browse(self):
         from tkinter import filedialog
@@ -817,7 +848,8 @@ class App:
             z = zip_session(rec.out)
             self.msg = (f"Saved {z.name}: {meta['duration_s'] / 60:.1f} min, {meta['fps_actual']} fps, "
                         f"{z.stat().st_size / 1e9:.2f} GB." +
-                        (f" WARNINGS: {'; '.join(meta['warnings'])}" if meta["warnings"] else " Quality OK."))
+                        (f" WARNINGS: {'; '.join(meta['warnings'])}" if meta["warnings"] else " Quality OK.") +
+                        " Next: upload the zip to the Drive folder (button above).")
         except Exception as e:
             log(f"save failed: {e!r}")
             self.msg = f"Save failed: {e}. Raw files are kept in {rec.out}"
@@ -922,13 +954,23 @@ def selftest(a):
     log("SELFTEST OK")
 
 
+def uitest():
+    app = App()
+    app.root.update()
+    log(f"UI OK windows={len(app.targets)} raw_input={'on' if app.raw else 'off'}")
+    app.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", metavar="DIR")
+    ap.add_argument("--uitest", action="store_true")
     ap.add_argument("--seconds", type=float, default=3)
     a = ap.parse_args()
     try:
-        if a.selftest:
+        if a.uitest:
+            uitest()
+        elif a.selftest:
             selftest(a)
         else:
             App().root.mainloop()

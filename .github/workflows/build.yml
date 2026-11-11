@@ -25,6 +25,12 @@ jobs:
           $p = Start-Process dist\MitoRecorder.exe -ArgumentList "--selftest","st","--seconds","4" -Wait -PassThru
           Get-Content "$env:USERPROFILE\MitoRecorder.log"
           exit $p.ExitCode
+      - name: UI smoke test (window builds, Raw Input starts)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\MitoRecorder.exe -ArgumentList "--uitest" -Wait -PassThru
+          Get-Content "$env:USERPROFILE\MitoRecorder.log" -Tail 3
+          exit $p.ExitCode
       - uses: actions/upload-artifact@v4
         with:
           name: MitoRecorder
