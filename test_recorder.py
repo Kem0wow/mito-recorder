@@ -3,7 +3,16 @@ import zipfile
 import numpy as np
 import pytest
 
-from recorder import AudioOut, audio_pad, next_index, out_size, quality, safe_name, vk_name, zip_session
+from recorder import AudioOut, audio_pad, duration_tag, free_zip_name, next_index, out_size, quality, safe_name, \
+    vk_name, zip_session
+
+
+def test_zip_name(tmp_path):
+    assert duration_tag(26 * 60 + 38) == "26m_38s" and duration_tag(3600 + 26 * 60 + 38) == "1h_26m_38s"
+    assert duration_tag(42) == "42s" and duration_tag(3600 * 2 + 5) == "2h_0m_5s"
+    assert free_zip_name(tmp_path, "minecraft", "1h_26m_38s") == "minecraft_1h_26m_38s"
+    (tmp_path / "minecraft_1h_26m_38s.zip").write_bytes(b"")
+    assert free_zip_name(tmp_path, "minecraft", "1h_26m_38s") == "minecraft_1h_26m_38s_2"
 
 
 def test_safe_name():
@@ -88,3 +97,34 @@ def test_quality():
         assert s in text, (s, w)
     _, w = quality(20, 30, [1] * 600, [0.01], [40.0], ev, 20.0, 1.0, 0)
     assert any("silent" in x for x in w)
+
+
+def test_summarize():
+    from recorder import format_hms, summarize
+    names = ["minecraft_1h_26m_38s.zip", "Minecraft_30m_22s.zip", "Doom_2_42s.zip", "doom 2_1m_18s_2.zip",
+             "Minecraft_3.zip", "notes.txt"]
+    rows, other = summarize(names)
+    # minecraft: 5198 + 1822 s in 2 runs; "doom 2" and "Doom_2" are different game names
+    assert rows == [("minecraft", 7020, 2), ("doom 2", 78, 1), ("Doom_2", 42, 1)], rows
+    assert other == ["Minecraft_3.zip"]
+    assert format_hms(7020) == "1 h 57 min 0 s" and format_hms(42) == "0 h 0 min 42 s"
+
+
+def test_fetch_error_text():
+    import socket
+    import urllib.error
+    from recorder import fetch_error_text
+    assert fetch_error_text(urllib.error.URLError("[Errno -3] Temporary failure in name resolution")) == \
+        "no internet connection"
+    assert fetch_error_text(socket.timeout("timed out")) == "no internet connection"
+    assert fetch_error_text(urllib.error.HTTPError("u", 403, "forbidden", None, None)).startswith("Drive refused")
+
+
+def test_live_issues():
+    from recorder import live_issues
+    ok = {"fps": 30, "target": 30, "black": False, "dropped_recent": 0, "unfocused_s": 0, "silent_s": 5,
+          "idle_s": 5, "disk_low": False}
+    assert live_issues(ok) == []
+    bad = dict(ok, fps=12, black=True, unfocused_s=20)
+    assert live_issues(bad) == [("high", "black"), ("high", "fps"), ("high", "focus")]
+    assert live_issues(dict(ok, fps=25)) == [("mid", "fps")] and live_issues(dict(ok, silent_s=90)) == [("mid", "sound")]

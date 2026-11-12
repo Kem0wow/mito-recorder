@@ -13,6 +13,11 @@ jobs:
       - run: pip install -r requirements.txt pyinstaller pytest
       - run: pip install --no-deps windows-capture  # its opencv dependency is unused, kept out of the exe
       - run: pytest -q test_recorder.py
+      - name: Write Drive key from secret (never committed)
+        shell: pwsh
+        run: Set-Content -Path drive_key.py -Value "DRIVE_API_KEY = '$env:DRIVE_API_KEY'"
+        env:
+          DRIVE_API_KEY: ${{ secrets.DRIVE_API_KEY }}
       - name: Build exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name MitoRecorder
