@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.2"
+VERSION = "2.3"
 DRIVE_FOLDER_ID = "1g-eHWyhihvk86EOgC-639riVl9WZGBXo"
 UPLOAD_URL = f"https://drive.google.com/drive/folders/{DRIVE_FOLDER_ID}?usp=sharing"
 try:  # drive_key.py is not in git: CI writes it from a secret before building the exe
@@ -54,7 +54,7 @@ STR = {
  "fix_header": "PROBLEMS AND FIXES (click the warning on the Record tab to jump here)",
  "update_data": "Update data", "data_reading": "Reading the Drive folder...",
  "data_nokey": "Data needs a Google API key: set DRIVE_API_KEY in recorder.py (see README).",
- "data_summary": "{n} recordings, {g} games.", "data_none": "None", "col_game": "Game", "col_total": "Recorded",
+ "data_summary": "{n} recording(s), {g} game(s).", "data_none": "None", "col_game": "Game", "col_total": "Recorded",
  "col_runs": "Recordings", "hms": "{h} h {m} min {s} s",
  "no_internet": "no internet connection",
  "drive_http": "Drive refused the request (HTTP {code}). Check DRIVE_API_KEY and that the folder is shared.",
@@ -177,6 +177,10 @@ if IS_WIN:  # physical pixels, so window rects, capture and cursor positions agr
     except Exception:
         ctypes.windll.user32.SetProcessDPIAware()
     ctypes.windll.user32.GetForegroundWindow.restype = ctypes.c_void_p
+
+
+def resource(name):  # next to recorder.py, or unpacked inside the exe (PyInstaller)
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / name
 
 
 def log(msg):
@@ -1143,6 +1147,13 @@ class App:
         root.title("Mito Recorder")
         ttk.Style(root).theme_use("vista" if IS_WIN else "clam")  # native look on Windows
         root.resizable(False, False)
+        try:  # window and taskbar icon
+            if IS_WIN:
+                root.iconbitmap(str(resource("icon.ico")))
+            self._icon = tk.PhotoImage(file=str(resource("icon.png")))
+            root.iconphoto(True, self._icon)
+        except Exception as e:
+            log(f"icon: {e}")
         self.fps, self.game = tk.IntVar(value=FPS), tk.StringVar()
         self.dpi, self.sens = tk.StringVar(), tk.StringVar()
         self.quality = tk.StringVar(value=X264_DEFAULT)

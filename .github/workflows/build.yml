@@ -20,7 +20,7 @@ jobs:
           DRIVE_API_KEY: ${{ secrets.DRIVE_API_KEY }}
       - name: Build exe
         run: >
-          pyinstaller --noconfirm --onefile --windowed --name MitoRecorder
+          pyinstaller --noconfirm --onefile --windowed --name MitoRecorder --icon icon.ico --add-data "icon.png;." --add-data "icon.ico;."
           --collect-all av --hidden-import windows_capture --hidden-import pyaudiowpatch
           --exclude-module cv2 --exclude-module PIL --exclude-module faster_whisper
           recorder.py
