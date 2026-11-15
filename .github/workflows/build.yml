@@ -59,6 +59,7 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           ver=$(python -c "import re;print(re.search(r'^VERSION = \"(.+)\"', open('recorder.py', encoding='utf-8').read(), re.M).group(1))")
           [ "$tag" = "v$ver" ] || { echo "tag $tag != VERSION $ver"; exit 1; }
+          git fetch -q --force origin "refs/tags/$tag:refs/tags/$tag"  # checkout leaves out the annotated tag object
           git tag -l --format='%(contents)' "$tag" > notes.md
           [ -s notes.md ] || git log -1 --pretty=%B > notes.md
           gh release create "$tag" dist/MitoRecorder.exe --title "Mito Recorder $tag" --notes-file notes.md
