@@ -13,6 +13,9 @@ def test_zip_name(tmp_path):
     assert free_zip_name(tmp_path, "minecraft", "1h_26m_38s") == "minecraft_1h_26m_38s"
     (tmp_path / "minecraft_1h_26m_38s.zip").write_bytes(b"")
     assert free_zip_name(tmp_path, "minecraft", "1h_26m_38s") == "minecraft_1h_26m_38s_2"
+    from recorder import X264_PROFILES, quality_tag
+    assert quality_tag(X264_PROFILES["Light (less CPU, bigger files)"]) == "light"
+    assert quality_tag(X264_PROFILES["Good quality (heavy CPU)"]) == "good"
 
 
 def test_safe_name():
@@ -102,10 +105,10 @@ def test_quality():
 def test_summarize():
     from recorder import format_hms, summarize
     names = ["minecraft_1h_26m_38s.zip", "Minecraft_30m_22s.zip", "Doom_2_42s.zip", "doom 2_1m_18s_2.zip",
-             "Minecraft_3.zip", "notes.txt"]
+             "Minecraft_3.zip", "notes.txt", "Minecraft_light_1h_2m_7s.zip", "doom 2_good_10s.zip"]
     rows, other = summarize(names)
     # minecraft: 5198 + 1822 s in 2 runs; "doom 2" and "Doom_2" are different game names
-    assert rows == [("minecraft", 7020, 2), ("doom 2", 78, 1), ("Doom_2", 42, 1)], rows
+    assert rows == [("minecraft", 10747, 3), ("doom 2", 88, 2), ("Doom_2", 42, 1)], rows
     assert other == ["Minecraft_3.zip"]
     assert format_hms(7020) == "1 h 57 min 0 s" and format_hms(42) == "0 h 0 min 42 s"
 
@@ -128,3 +131,30 @@ def test_live_issues():
     bad = dict(ok, fps=12, black=True, unfocused_s=20)
     assert live_issues(bad) == [("high", "black"), ("high", "fps"), ("high", "focus")]
     assert live_issues(dict(ok, fps=25)) == [("mid", "fps")] and live_issues(dict(ok, silent_s=90)) == [("mid", "sound")]
+
+
+def test_self_update_pieces(tmp_path):
+    import hashlib
+    import json
+    from recorder import download_verified, is_newer, latest_release, swap_exe
+    assert is_newer("v2.10", "2.9") and is_newer("v2.4", "2.3") and not is_newer("v2.3", "2.3")
+    assert not is_newer("v2.2", "2.3") and is_newer("v2.3", "0.0")
+    exe_new = tmp_path / "rel.exe"
+    exe_new.write_bytes(b"new build")
+    sha = hashlib.sha256(b"new build").hexdigest()
+    api = tmp_path / "latest.json"
+    asset = {"name": "MitoRecorder.exe", "browser_download_url": exe_new.as_uri(), "digest": f"sha256:{sha}"}
+    api.write_text(json.dumps({"tag_name": "v9.1", "body": "notes", "assets": [asset]}))
+    info = latest_release(api.as_uri())
+    assert info == {"tag": "v9.1", "notes": "notes", "url": exe_new.as_uri(), "sha256": sha}
+    api.write_text(json.dumps({"tag_name": "v9.1", "assets": [dict(asset, digest=None)]}))
+    with pytest.raises(RuntimeError, match="sha256"):  # no checksum: refuse
+        latest_release(api.as_uri())
+    with pytest.raises(RuntimeError, match="sha256"):  # wrong checksum: refuse, nothing left behind
+        download_verified(info["url"], "0" * 64, tmp_path / "x.new.exe")
+    assert not list(tmp_path.glob("x.new.exe*"))
+    exe = tmp_path / "MitoRecorder.exe"
+    exe.write_bytes(b"old build")
+    new = download_verified(info["url"], sha, tmp_path / "MitoRecorder.new.exe")
+    old = swap_exe(exe, new)
+    assert exe.read_bytes() == b"new build" and old.read_bytes() == b"old build" and not new.exists()

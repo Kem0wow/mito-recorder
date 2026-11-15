@@ -1,5 +1,7 @@
 name: build-exe
-on: [push, workflow_dispatch]
+on: [push, workflow_dispatch]  # a pushed v* tag builds and publishes the GitHub release the app updates from
+permissions:
+  contents: write  # gh release create
 
 jobs:
   windows:
@@ -36,7 +38,27 @@ jobs:
           $p = Start-Process dist\MitoRecorder.exe -ArgumentList "--uitest" -Wait -PassThru
           Get-Content "$env:USERPROFILE\MitoRecorder.log" -Tail 3
           exit $p.ExitCode
+      - name: Self-update test (a copy of the exe updates itself from the latest release)
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $p = Start-Process dist\MitoRecorder.exe -ArgumentList "--updatetest","upd" -Wait -PassThru
+          Get-Content "$env:USERPROFILE\MitoRecorder.log" -Tail 12
+          exit $p.ExitCode
       - uses: actions/upload-artifact@v4
         with:
           name: MitoRecorder
           path: dist/MitoRecorder.exe
+      - name: Publish release (v* tags only; tag must match VERSION in recorder.py)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver=$(python -c "import re;print(re.search(r'^VERSION = \"(.+)\"', open('recorder.py', encoding='utf-8').read(), re.M).group(1))")
+          [ "$tag" = "v$ver" ] || { echo "tag $tag != VERSION $ver"; exit 1; }
+          git tag -l --format='%(contents)' "$tag" > notes.md
+          [ -s notes.md ] || git log -1 --pretty=%B > notes.md
+          gh release create "$tag" dist/MitoRecorder.exe --title "Mito Recorder $tag" --notes-file notes.md

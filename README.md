@@ -4,9 +4,13 @@ Records gameplay as training data for a game-playing AI. Nothing is uploaded: ea
 
 1. Run `MitoRecorder.exe`, pick the **game window** (run the game in windowed or borderless mode), check the game name. Instructions and tips are on the **Instructions** tab.
 2. **Start** (or **F9** while in the game). Play. **F9** again to stop. The zip is written automatically.
-3. Upload the zips from `C:\Users\<you>\MitoData\` (one `<Game>_<duration>.zip` per run, e.g. `minecraft_1h_26m_38s.zip`, do not unzip) to the shared Drive folder: https://drive.google.com/drive/folders/1g-eHWyhihvk86EOgC-639riVl9WZGBXo?usp=sharing (the app has an Upload button).
+3. Upload the zips from `C:\Users\<you>\MitoData\` (one `<Game>_<quality>_<duration>.zip` per run, e.g. `Minecraft_light_1h_2m_7s.zip`, do not unzip) to the shared Drive folder: https://drive.google.com/drive/folders/1g-eHWyhihvk86EOgC-639riVl9WZGBXo?usp=sharing (the app has an Upload button).
 
-Recorded: the game window (720p max, 30 fps; video quality on the Record tab: Good = heavier on the CPU, Light = mid quality, less CPU), the **game's own sound** (only that program's audio, so voice chat and music apps are left out; if Windows cannot isolate it, all PC sound is recorded and the result says so), and keyboard + mouse **only while the game window is focused** (F9 is never logged).
+4. Updates: the **Update** tab checks GitHub at start-up and shows "(new!)" when a newer release exists. **Update now** downloads it, checks its sha256 against the one GitHub publishes, swaps the exe and restarts. No need to download a new exe by hand.
+
+Releases: bump `VERSION` in `recorder.py`, commit, then push an annotated tag `v<VERSION>` (its message becomes the release notes). CI builds and tests the exe, runs a self-update test against the current latest release, and publishes the release.
+
+Recorded: the game window (720p max, 30 fps; video quality on the Record tab: Good = the standard, Light = same quality target for weak PCs: less CPU, bigger files), the **game's own sound** (only that program's audio, so voice chat and music apps are left out; if Windows cannot isolate it, all PC sound is recorded and the result says so), and keyboard + mouse **only while the game window is focused** (F9 is never logged).
 
 Inside each zip: `video.mp4` (fragmented, so a crash keeps it playable), `frames.csv` (with source-frame arrival time and a fresh/repeat flag), `inputs.jsonl` (Windows Raw Input, so mouse motion works in FPS games), `game_audio.ogg` (Opus, 96 kbps), `meta.json` (system info, your optional mouse DPI / sensitivity, a quality report with warnings). All share one clock; t = 0 is Start.
 

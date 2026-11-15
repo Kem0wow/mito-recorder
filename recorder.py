@@ -1,6 +1,6 @@
 """Mito Recorder: record gameplay as training data for a game-playing AI (VLA).
 
-Each run becomes one zip in the save folder, named <Game>_<duration>.zip (e.g. minecraft_1h_26m_38s.zip), holding
+Each run becomes one zip in the save folder, named <Game>_<quality>_<duration>.zip (e.g. Minecraft_light_1h_2m_7s.zip), holding
   video.mp4        H.264 (x264 veryfast, CRF 20), scaled down to at most 720p, constant FPS (default 30)
   frames.csv       frame, t (grab time), src_t (source frame arrival), fresh (0 = repeat of the previous frame)
   inputs.jsonl     keyboard + mouse from Windows Raw Input, logged only while the game window is focused,
@@ -13,6 +13,7 @@ Everything shares one clock: session time 0 = Start. Thoughts / dataset labellin
 
 CLI:  recorder.py                  -> UI
       recorder.py --selftest DIR   -> record the screen a few seconds with injected input, zip, verify
+      recorder.py --updatetest DIR -> (exe only) update a copy of itself from the latest GitHub release, verify
 """
 import argparse
 import csv
@@ -25,6 +26,7 @@ import re
 import shutil
 import statistics
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -36,7 +38,9 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.3"
+VERSION = "2.4"
+REPO = "Kem0wow/mito-recorder"  # public; each v* tag gets a release with MitoRecorder.exe (CI)
+RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 DRIVE_FOLDER_ID = "1g-eHWyhihvk86EOgC-639riVl9WZGBXo"
 UPLOAD_URL = f"https://drive.google.com/drive/folders/{DRIVE_FOLDER_ID}?usp=sharing"
 try:  # drive_key.py is not in git: CI writes it from a secret before building the exe
@@ -45,7 +49,13 @@ except ImportError:
     DRIVE_API_KEY = ""
 STR = {
 "en": {
- "tab_record": "Record", "tab_instr": "Instructions", "tab_data": "Data",
+ "tab_record": "Record", "tab_instr": "Instructions", "tab_data": "Data", "tab_update": "Update",
+ "tab_update_new": "Update (new!)", "this_version": "This version: v{v}", "check_update": "Check for updates",
+ "update_now": "Update now", "upd_checking": "Checking GitHub...", "upd_latest": "You have the latest version.",
+ "upd_new": "New version v{v} is available. Press Update now: the app downloads it, checks it and restarts.",
+ "upd_downloading": "Downloading v{v}...", "upd_restarting": "Updated. Restarting...",
+ "upd_recording": "Stop the recording first.", "upd_notexe": "Only the .exe can update itself.",
+ "upd_err": "Update check failed: {err}", "upd_notes": "What's new:",
  "game_window": "Game window", "refresh": "Refresh", "game_name": "Game name", "fps": "FPS",
  "dpi": "Mouse DPI (optional)", "sens": "Game sensitivity (optional)", "quality": "Video quality",
  "save_to": "Save to", "browse": "Browse", "start": "Start (F9)", "stop": "Stop (F9)", "saving": "Saving...",
@@ -96,7 +106,13 @@ STR = {
           "no sound, low fps), fix it and record again.")
 },
 "tr": {
- "tab_record": "Kayıt", "tab_instr": "Talimatlar", "tab_data": "Veri",
+ "tab_record": "Kayıt", "tab_instr": "Talimatlar", "tab_data": "Veri", "tab_update": "Güncelleme",
+ "tab_update_new": "Güncelleme (yeni!)", "this_version": "Bu sürüm: v{v}", "check_update": "Güncellemeleri kontrol et",
+ "update_now": "Şimdi güncelle", "upd_checking": "GitHub kontrol ediliyor...", "upd_latest": "En son sürümü kullanıyorsun.",
+ "upd_new": "Yeni sürüm v{v} hazır. Şimdi güncelle'ye bas: uygulama indirir, kontrol eder ve yeniden açılır.",
+ "upd_downloading": "v{v} indiriliyor...", "upd_restarting": "Güncellendi. Yeniden açılıyor...",
+ "upd_recording": "Önce kaydı durdur.", "upd_notexe": "Sadece .exe kendini güncelleyebilir.",
+ "upd_err": "Güncelleme kontrolü başarısız: {err}", "upd_notes": "Yenilikler:",
  "game_window": "Oyun penceresi", "refresh": "Yenile", "game_name": "Oyun adı", "fps": "FPS",
  "dpi": "Mouse DPI (isteğe bağlı)", "sens": "Oyun hassasiyeti (isteğe bağlı)", "quality": "Video kalitesi",
  "save_to": "Kayıt klasörü", "browse": "Gözat", "start": "Başlat (F9)", "stop": "Durdur (F9)",
@@ -157,14 +173,19 @@ def tr(key, lang="en", **kw):
 
 
 IS_WIN = sys.platform == "win32"
-FPS = 30
+FPS = 30  # fixed, not user-editable: training samples 6 or 9 fps groups from it
 MIN_FREE = 3e9   # refuse to start with less free disk than this
 LOW_FREE = 5e8   # stop (and save) a running session below this
 MAX_H = 720
 # Encode profiles (picked on the Record tab). Good = fine detail for labels, heavier on the CPU.
 X264_PROFILES = {"Good quality (heavy CPU)": {"preset": "veryfast", "crf": "20"},
-                 "Light (mid quality)": {"preset": "ultrafast", "crf": "23"}}
+                 "Light (less CPU, bigger files)": {"preset": "ultrafast", "crf": "20"}}  # same CRF as Good: quality kept for training, CPU saved by the preset
 X264_DEFAULT = "Good quality (heavy CPU)"
+
+
+def quality_tag(x264):
+    """x264 options -> 'light' or 'good', for the zip name (training keeps light runs out of focus/OCR labels)."""
+    return "light" if x264 == X264_PROFILES["Light (less CPU, bigger files)"] else "good"
 AUDIO_BPS = 96_000
 LOG = Path.home() / "MitoRecorder.log"
 if sys.stdout is None or sys.stderr is None:  # --windowed exe: no console, send prints to a log file
@@ -333,7 +354,7 @@ def free_zip_name(root, game, tag):
     return name
 
 
-ZIP_RE = re.compile(r"^(?P<game>.+?)_(?P<dur>(?:\d+h_)?(?:\d+m_)?\d+s)(?:_\d+)?\.zip$")  # lazy: game may contain _
+ZIP_RE = re.compile(r"^(?P<game>.+?)_(?:(?:good|light)_)?(?P<dur>(?:\d+h_)?(?:\d+m_)?\d+s)(?:_\d+)?\.zip$")  # lazy: game may contain _
 
 
 def parse_duration(tag):
@@ -382,6 +403,97 @@ def drive_zip_names(api_key, folder_id=DRIVE_FOLDER_ID):
         token = data.get("nextPageToken")
         if not token:
             return names
+
+
+# ---------------------------------------------------------------- self-update from GitHub releases
+
+def version_tuple(v):
+    """'v2.10' -> (2, 10): numeric compare, so 2.10 > 2.9."""
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def is_newer(tag, current=VERSION):
+    return version_tuple(tag) > version_tuple(current)
+
+
+def _gh_request(url):
+    import urllib.request
+    h = {"User-Agent": "MitoRecorder", "Accept": "application/vnd.github+json"}
+    if os.environ.get("GITHUB_TOKEN"):  # CI only: avoids the shared runners' anonymous rate limit
+        h["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    return urllib.request.Request(url, headers=h)
+
+
+def latest_release(url=RELEASES_API):
+    """Newest release: {tag, notes, url, sha256} of its MitoRecorder.exe. GitHub computes the sha256 itself."""
+    import urllib.request
+    with urllib.request.urlopen(_gh_request(url), timeout=20) as r:
+        d = json.load(r)
+    a = next((a for a in d.get("assets", []) if a["name"] == "MitoRecorder.exe"), None)
+    if not a:
+        raise RuntimeError(f"release {d.get('tag_name')} has no MitoRecorder.exe")
+    digest = a.get("digest") or ""
+    if not digest.startswith("sha256:"):  # never run a download we cannot check
+        raise RuntimeError(f"release {d.get('tag_name')} has no sha256 for MitoRecorder.exe")
+    return {"tag": d["tag_name"], "notes": (d.get("body") or "").strip(), "url": a["browser_download_url"],
+            "sha256": digest.split(":", 1)[1].lower()}
+
+
+def download_verified(url, sha256, dest):
+    """Download to dest (via dest.part); refuse it unless its sha256 matches."""
+    import hashlib
+    import urllib.request
+    dest, h = Path(dest), hashlib.sha256()
+    tmp = dest.with_name(dest.name + ".part")
+    with urllib.request.urlopen(_gh_request(url), timeout=60) as r, open(tmp, "wb") as f:
+        for chunk in iter(lambda: r.read(1 << 20), b""):
+            h.update(chunk)
+            f.write(chunk)
+    if h.hexdigest() != sha256.lower():
+        tmp.unlink()
+        raise RuntimeError("downloaded file failed the sha256 check")
+    tmp.replace(dest)
+    return dest
+
+
+def swap_exe(exe, new):
+    """exe -> exe.old, new -> exe. Windows lets a running exe be renamed (not deleted); the new one deletes .old."""
+    exe, new = Path(exe), Path(new)
+    old = exe.with_suffix(".old")
+    if old.exists():
+        old.unlink()
+    exe.replace(old)
+    try:
+        new.replace(exe)
+    except OSError:
+        old.replace(exe)  # put the working exe back
+        raise
+    return old
+
+
+def apply_update(info, exe=None, relaunch=()):
+    """Download + verify + swap the running exe, start the new one. Returns the new process."""
+    exe = Path(exe or sys.executable)
+    new = download_verified(info["url"], info["sha256"], exe.with_name(exe.stem + ".new.exe"))
+    swap_exe(exe, new)
+    log(f"updated {exe.name} to {info['tag']}")
+    return subprocess.Popen([str(exe), *relaunch])
+
+
+def cleanup_old_exe(wait_s=5.0):
+    """Delete <exe>.old left by an update (the old process may need a moment to exit)."""
+    if not getattr(sys, "frozen", False):
+        return
+    old = Path(sys.executable).with_suffix(".old")
+    end = time.monotonic() + wait_s
+    while old.exists():
+        try:
+            old.unlink()
+            log(f"removed {old.name}")
+        except OSError:
+            if time.monotonic() > end:
+                return
+            time.sleep(0.25)
 
 
 def live_issues(m):
@@ -1154,7 +1266,7 @@ class App:
             root.iconphoto(True, self._icon)
         except Exception as e:
             log(f"icon: {e}")
-        self.fps, self.game = tk.IntVar(value=FPS), tk.StringVar()
+        self.game = tk.StringVar()
         self.dpi, self.sens = tk.StringVar(), tk.StringVar()
         self.quality = tk.StringVar(value=X264_DEFAULT)
         self.out = tk.StringVar(value=str(Path.home() / "MitoData"))
@@ -1163,7 +1275,9 @@ class App:
         self.issues, self.mon, self.unf_since, self.last_mon, self.blink_n = [], [], None, 0.0, 0
         self.marker_req = False  # unused since F8 markers were removed
         self.data_q, self.last_data, self.targets = queue.Queue(), None, []
+        self.upd_q, self.upd_info, self.upd_status = queue.Queue(), None, tk.StringVar(value="")
         self.build()
+        self.check_update()
         self.refresh()
         if IS_WIN:
             try:
@@ -1200,10 +1314,25 @@ class App:
         nb = ttk.Notebook(root)
         nb.pack(fill="both", expand=True)
         f, ins, dat = ttk.Frame(nb, padding=16), ttk.Frame(nb, padding=16), ttk.Frame(nb, padding=16)
+        upd = ttk.Frame(nb, padding=16)
         nb.add(f, text=t("tab_record"))
         nb.add(ins, text=t("tab_instr"))
         nb.add(dat, text=t("tab_data"))
-        self.nb, self.ins = nb, ins
+        nb.add(upd, text=t("tab_update"))
+        self.nb, self.ins, self.upd_tab = nb, ins, upd
+
+        # Update tab
+        ttk.Label(upd, text=t("this_version", v=VERSION)).pack(anchor="w")
+        btns = ttk.Frame(upd)
+        btns.pack(anchor="w", pady=8)
+        ttk.Button(btns, text=t("check_update"), command=self.check_update).pack(side="left")
+        self.upd_btn = ttk.Button(btns, text=t("update_now"), command=self.do_update, state="disabled")
+        self.upd_btn.pack(side="left", padx=6)
+        ttk.Label(upd, textvariable=self.upd_status, wraplength=560, justify="left").pack(anchor="w")
+        self.upd_notes = ttk.Label(upd, text="", wraplength=560, justify="left")
+        self.upd_notes.pack(anchor="w", pady=(10, 0))
+        if self.upd_info:
+            self.show_update(("ok", self.upd_info))
 
         # Data tab
         ttk.Button(dat, text=t("update_data"), command=self.update_data).pack(anchor="w")
@@ -1231,7 +1360,6 @@ class App:
             self.target.set(self.target_text)
         line(t("game_window"), self.target, ttk.Button(f, text=t("refresh"), command=self.refresh))
         line(t("game_name"), ttk.Entry(f, textvariable=self.game, width=58))
-        line(t("fps"), ttk.Spinbox(f, from_=1, to=60, textvariable=self.fps, width=6))
         line(t("dpi"), ttk.Entry(f, textvariable=self.dpi, width=10))
         line(t("sens"), ttk.Entry(f, textvariable=self.sens, width=10))
         line(t("quality"), ttk.Combobox(f, state="readonly", width=30, values=list(X264_PROFILES),
@@ -1334,8 +1462,7 @@ class App:
         game, root = safe_name(self.game.get()), Path(self.out.get())
         d = root / f"{game}_{next_index(root, game)}"
         try:
-            fps = max(1, min(60, int(self.fps.get())))
-            self.rec = Recorder(d, fps, lambda: window_rect(hwnd), target=("window", hwnd), hwnd=hwnd,
+            self.rec = Recorder(d, FPS, lambda: window_rect(hwnd), target=("window", hwnd), hwnd=hwnd,
                                 pid=window_pid(hwnd), x264=X264_PROFILES[self.quality.get()],
                                 game=game, title=title,
                                 user={"mouse_dpi": self.dpi.get().strip(),
@@ -1349,7 +1476,8 @@ class App:
     def _finish(self, rec):
         try:
             meta = rec.stop()
-            z = zip_session(rec.out, free_zip_name(rec.out.parent, rec.game, duration_tag(meta["duration_s"])))
+            z = zip_session(rec.out, free_zip_name(rec.out.parent, rec.game,
+                                                   f"{quality_tag(rec.x264)}_{duration_tag(meta['duration_s'])}"))
             self.msg = (self.t("saved", name=z.name, minutes=meta["duration_s"] / 60, fps=meta["fps_actual"],
                                gb=z.stat().st_size / 1e9) + " " +
                         (self.t("warnings", w="; ".join(meta["warnings"])) if meta["warnings"] else self.t("quality_ok")) +
@@ -1381,7 +1509,53 @@ class App:
         if rec:
             rec.on_raw(ev)
 
+    def check_update(self):
+        self.upd_status.set(self.t("upd_checking"))
+        threading.Thread(target=lambda: self.upd_q.put(self._try(latest_release)), daemon=True).start()
+
+    def do_update(self):
+        if self.rec or self.busy:
+            self.upd_status.set(self.t("upd_recording"))
+            return
+        if not getattr(sys, "frozen", False):
+            self.upd_status.set(self.t("upd_notexe"))
+            return
+        info = self.upd_info
+        self.upd_btn.state(["disabled"])
+        self.upd_status.set(self.t("upd_downloading", v=info["tag"].lstrip("v")))
+        threading.Thread(target=lambda: self.upd_q.put(self._try(apply_update, info, kind="done")),
+                         daemon=True).start()
+
+    @staticmethod
+    def _try(fn, *args, kind="ok"):  # worker thread: result or error text, for tick()
+        try:
+            return kind, fn(*args)
+        except Exception as e:
+            log(f"update: {e!r}")
+            return "err", f"{type(e).__name__}: {e}"
+
+    def show_update(self, res):
+        kind, val = res
+        if kind == "err":
+            self.upd_status.set(self.t("upd_err", err=val))
+            self.upd_btn.state(["!disabled"] if self.upd_info else ["disabled"])
+        elif kind == "done":  # new exe already started: hand over
+            self.upd_status.set(self.t("upd_restarting"))
+            self.root.after(300, self.close)
+        elif is_newer(val["tag"]):
+            self.upd_info = val
+            self.upd_status.set(self.t("upd_new", v=val["tag"].lstrip("v")))
+            self.upd_notes.config(text=(self.t("upd_notes") + "\n" + val["notes"]) if val["notes"] else "")
+            self.upd_btn.state(["!disabled"])
+            self.nb.tab(self.upd_tab, text=self.t("tab_update_new"))
+        else:
+            self.upd_status.set(self.t("upd_latest"))
+
     def tick(self):
+        try:
+            self.show_update(self.upd_q.get_nowait())
+        except queue.Empty:
+            pass
         if self.toggle_req:
             self.toggle_req = False
             self.toggle()
@@ -1527,14 +1701,53 @@ def uitest():
     app.close()
 
 
+def updatetest(d):
+    """CI, built exe: put a copy of this exe in d, let the copy update itself from the latest release as if it
+    were v0.0 (download, sha256 check, rename-while-running, restart with --uitest), then check the result."""
+    import hashlib
+    assert getattr(sys, "frozen", False), "--updatetest needs the built exe"
+    d = Path(d)
+    shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True)
+    exe = d / "MitoRecorder.exe"
+    shutil.copy2(sys.executable, exe)
+    info = latest_release()
+    log(f"latest release {info['tag']} sha256 {info['sha256'][:12]}...")
+    rc = subprocess.run([str(exe), "--update-now", "--as-version", "0.0"]).returncode
+    assert rc == 0, f"update + restarted --uitest exited {rc}"
+    got = hashlib.sha256(exe.read_bytes()).hexdigest()
+    assert got == info["sha256"], f"exe after update is not the release ({got[:12]})"
+    assert not (d / "MitoRecorder.new.exe").exists(), "leftover download"
+    rc = subprocess.run([str(exe), "--uitest"]).returncode  # old process gone now: .old must be cleaned up
+    assert rc == 0, f"updated exe --uitest exited {rc}"
+    if version_tuple(info["tag"]) >= (2, 4):  # releases before 2.4 have no cleanup
+        assert not exe.with_suffix(".old").exists(), "MitoRecorder.old was not removed"
+    log("UPDATETEST OK")
+
+
+def update_now(as_version):
+    """Child of --updatetest: update this exe if the release is newer than as_version, run the new one."""
+    info = latest_release()
+    assert is_newer(info["tag"], as_version), info["tag"]
+    raise SystemExit(apply_update(info, relaunch=["--uitest"]).wait())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", metavar="DIR")
     ap.add_argument("--uitest", action="store_true")
+    ap.add_argument("--updatetest", metavar="DIR")
+    ap.add_argument("--update-now", action="store_true")
+    ap.add_argument("--as-version", default=VERSION)
     ap.add_argument("--seconds", type=float, default=3)
     a = ap.parse_args()
+    cleanup_old_exe()
     try:
-        if a.uitest:
+        if a.updatetest:
+            updatetest(a.updatetest)
+        elif a.update_now:
+            update_now(a.as_version)
+        elif a.uitest:
             uitest()
         elif a.selftest:
             selftest(a)
