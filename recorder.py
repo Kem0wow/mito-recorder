@@ -39,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.4"
+VERSION = "2.5"
 REPO = "Kem0wow/mito-recorder"  # public; each v* tag gets a release with MitoRecorder.exe (CI)
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 DRIVE_FOLDER_ID = "1g-eHWyhihvk86EOgC-639riVl9WZGBXo"
@@ -207,6 +207,20 @@ def resource(name):  # next to recorder.py, or unpacked inside the exe (PyInstal
 
 def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def set_priority(level):
+    """Priority of the calling thread (Windows): +1 above normal for input/capture/audio (their timestamps must not
+    starve while x264 loads the CPU), -1 below normal for scaling/encoding (never fight the game for CPU)."""
+    if not IS_WIN:
+        return
+    try:
+        k = ctypes.windll.kernel32
+        k.GetCurrentThread.restype = ctypes.c_void_p
+        k.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        k.SetThreadPriority(k.GetCurrentThread(), level)
+    except Exception:
+        pass
 
 
 def mss_cls():
@@ -871,6 +885,7 @@ class RawInput:
         u.DispatchMessageW.argtypes = [POINTER(W.MSG)]
         u.GetRawInputData.argtypes = [W.HANDLE, W.UINT, W.LPVOID, POINTER(W.UINT), W.UINT]
         u.GetRawInputData.restype = W.UINT
+        set_priority(1)
         try:
             self.tid = ctypes.windll.kernel32.GetCurrentThreadId()
             hwnd = u.CreateWindowExW(0, "STATIC", "mito-raw", 0, 0, 0, 0, 0, W.HWND(-3), None, None, None)
@@ -949,7 +964,8 @@ class Recorder:
         self.x264 = x264 or X264_PROFILES[X264_DEFAULT]
         self.backend, self.error, self.audio_info, self.audio_error, self.audio_note = None, None, None, None, None
         self.stop_ev, self.lock = threading.Event(), threading.Lock()
-        self.q = queue.Queue(maxsize=fps)  # ~1 s of frames; full => drop, never stall capture
+        self.q = queue.Queue(maxsize=8)    # ~0.25 s of full-res frames (4K = 33 MB each); full => drop, never stall;
+                                           # the encoder refills missed slots with repeats, so timing stays exact
         self.eq = queue.Queue(maxsize=4)   # scaled 720p frames waiting for x264 (keeps full-res RAM bounded)
         self.frames = self.dropped = 0  # frames = real captured frames; slots = frames in video.mp4 (incl. repeats)
         self.slots, self.video_t0, self.t_end = 0, 0.0, None
@@ -1091,7 +1107,7 @@ class Recorder:
         for border in (False, None):  # border toggle unsupported on older Windows 10
             try:
                 cap = WindowsCapture(cursor_capture=True, draw_border=border,
-                                     minimum_update_interval=max(1, int(500 / self.fps)),
+                                     minimum_update_interval=max(1, int(1000 / self.fps) - 4),  # <= ~34 copies/s, still >= fps
                                      **({"window_hwnd": val} if kind == "window" else {"monitor_index": val}))
 
                 @cap.event
@@ -1127,6 +1143,7 @@ class Recorder:
         return grab, sct.close
 
     def _capture(self):
+        set_priority(1)
         period, close = 1 / self.fps, None
         u = ctypes.windll.user32 if IS_WIN else None
         try:
@@ -1177,6 +1194,7 @@ class Recorder:
         """Full-res BGRA -> 720p yuv420p in one swscale pass (AREA keeps small UI text readable). Own thread, so it
         runs beside x264 in _encode instead of after it."""
         import av
+        set_priority(-1)
         w, h = self.vsize
         n = 0
         try:
@@ -1193,6 +1211,7 @@ class Recorder:
 
     def _encode(self):
         import av
+        set_priority(-1)
         w, h = self.vsize
         # fragmented mp4: a crash or power loss leaves a playable file
         with av.open(str(self.out / "video.mp4"), "w",
@@ -1242,6 +1261,7 @@ class Recorder:
 
     def _game_audio(self):
         """The game's own sound. If Windows can't isolate it, all PC sound instead, and the result says so."""
+        set_priority(1)
         out, stats, src, q = None, [0, 0], None, queue.Queue()  # stats: chunks, silent chunks
 
         def drain(timeout):

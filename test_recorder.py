@@ -158,3 +158,29 @@ def test_self_update_pieces(tmp_path):
     new = download_verified(info["url"], sha, tmp_path / "MitoRecorder.new.exe")
     old = swap_exe(exe, new)
     assert exe.read_bytes() == b"new build" and old.read_bytes() == b"old build" and not new.exists()
+
+
+def test_encoder_keeps_constant_30fps_when_capture_is_slow(tmp_path):
+    """27 fps capture with a 1 s stall still gives a 30 fps video as long as the session (repeats fill the gaps)."""
+    import csv
+    import threading
+    av = pytest.importorskip("av")
+    from recorder import Recorder
+    rec = Recorder(tmp_path, 30, lambda: None)
+    rec.vsize, rec.t_end = (320, 180), 12.0
+    ts = [i / 27 for i in range(270) if not 4 < i / 27 < 5]
+
+    def feed():
+        for i, t in enumerate(ts):
+            img = np.full((180, 320, 3), i % 255, np.uint8)
+            rec.eq.put((2.0 + t, av.VideoFrame.from_ndarray(img, format="rgb24").reformat(format="yuv420p"), 2.0 + t, 1))
+        rec.eq.put(None)
+
+    threading.Thread(target=feed, daemon=True).start()
+    rec._encode()
+    rows = list(csv.DictReader(open(tmp_path / "frames.csv")))
+    assert rec.slots == len(rows) == 300                     # 10 s * 30 fps
+    assert rec.frames == len(ts) and rec.slots - rec.frames == 300 - len(ts)
+    assert sum(r["fresh"] == "0" for r in rows) >= rec.slots - rec.frames
+    with av.open(str(tmp_path / "video.mp4")) as c:
+        assert sum(1 for _ in c.decode(video=0)) == 300
