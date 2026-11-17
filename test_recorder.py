@@ -179,8 +179,9 @@ def test_encoder_keeps_constant_30fps_when_capture_is_slow(tmp_path):
     threading.Thread(target=feed, daemon=True).start()
     rec._encode()
     rows = list(csv.DictReader(open(tmp_path / "frames.csv")))
-    assert rec.slots == len(rows) == 300                     # 10 s * 30 fps
-    assert rec.frames == len(ts) and rec.slots - rec.frames == 300 - len(ts)
+    assert rec.slots == len(rows) == 360                     # 12 s session * 30 fps, video time = session time
+    assert rows[0]["fresh"] == "0" and float(rows[0]["t"]) == 0.0   # slots before the first capture repeat it
+    assert rec.frames == len(ts) and rec.slots - rec.frames == 360 - len(ts)
     assert sum(r["fresh"] == "0" for r in rows) >= rec.slots - rec.frames
     with av.open(str(tmp_path / "video.mp4")) as c:
-        assert sum(1 for _ in c.decode(video=0)) == 300
+        assert sum(1 for _ in c.decode(video=0)) == 360

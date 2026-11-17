@@ -39,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.5"
+VERSION = "2.6"
 REPO = "Kem0wow/mito-recorder"  # public; each v* tag gets a release with MitoRecorder.exe (CI)
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 DRIVE_FOLDER_ID = "1g-eHWyhihvk86EOgC-639riVl9WZGBXo"
@@ -495,11 +495,18 @@ def apply_update(info, exe=None, relaunch=()):
     return subprocess.Popen([str(exe), *relaunch])
 
 
-def cleanup_old_exe(wait_s=5.0):
-    """Delete <exe>.old left by an update (the old process may need a moment to exit)."""
+def cleanup_old_exe(wait_s=30.0):
+    """After an update only the new exe stays: delete <exe>.old (the old process may need a moment to exit) and a
+    half-finished <exe>.new.exe download."""
     if not getattr(sys, "frozen", False):
         return
-    old = Path(sys.executable).with_suffix(".old")
+    exe = Path(sys.executable)
+    for junk in (exe.with_name(exe.stem + ".new.exe"), exe.with_name(exe.stem + ".new.exe.part")):
+        try:
+            junk.unlink()
+        except OSError:
+            pass
+    old = exe.with_suffix(".old")
     end = time.monotonic() + wait_s
     while old.exists():
         try:
@@ -1043,7 +1050,7 @@ class Recorder:
                    "video_size": list(self.vsize), "fps": self.fps, "fps_mode": "constant",
                    "video_frames": self.slots, "real_frames": self.frames, "repeated_frames": self.slots - self.frames,
                    "real_fps": meta["fps_actual"], "video_t0_s": meta["video_t0_s"],
-                   "frame_time": "frame k is at video_t0_s + k / fps on the session clock; repeated slots have fresh = 0 in frames.csv",
+                   "frame_time": "video time = session time: frame k is at k / fps seconds; repeated slots have fresh = 0 in frames.csv",
                    "capture": self.backend, "recorder": VERSION}
         (self.out / "profile.json").write_text(json.dumps(profile, indent=1))
         return meta
@@ -1226,7 +1233,8 @@ class Recorder:
             wr = csv.writer(f)
             # t = session time we grabbed the frame; src_t = when the source frame arrived; fresh = 0 if repeated
             wr.writerow(["frame", "t", "src_t", "fresh"])
-            # Constant frame rate on the session clock: video frame k sits at video_t0 + k / fps. If capture ran
+            # Constant frame rate on the session clock: video frame k sits at k / fps = session time k / fps (the
+            # slots before the first captured frame repeat that frame, fresh = 0). If capture ran
             # slow (say 27 of 30 fps) the missing slots are filled with a repeat of the previous frame (fresh = 0),
             # so the video is never shorter than the session and stays in sync with inputs.jsonl and the audio.
             last = None  # (yuv frame, src_t) of the last real frame
@@ -1242,10 +1250,10 @@ class Recorder:
             while (item := self.eq.get()) is not None:
                 t, fr, src_t, fresh = item
                 if last is None:
-                    self.video_t0 = t
-                target = round((t - self.video_t0) * self.fps)
-                while last and self.slots < target:
-                    put(last[0], self.video_t0 + self.slots / self.fps, last[1], 0)
+                    last = (fr, src_t)
+                target = round(t * self.fps)
+                while self.slots < target:
+                    put(last[0], self.slots / self.fps, last[1], 0)
                 if self.slots > target:
                     continue  # two grabs rounded to one slot (timer jitter): keep the first
                 put(fr, t, src_t, fresh)
@@ -1255,13 +1263,16 @@ class Recorder:
                 if fresh:
                     self.lags.append(t - src_t)
             if last and self.t_end is not None:  # trailing slots up to the end of the session
-                while self.slots < round((self.t_end - self.video_t0) * self.fps):
-                    put(last[0], self.video_t0 + self.slots / self.fps, last[1], 0)
+                while self.slots < round(self.t_end * self.fps):
+                    put(last[0], self.slots / self.fps, last[1], 0)
             c.mux(st.encode())
 
     def _game_audio(self):
         """The game's own sound. If Windows can't isolate it, all PC sound instead, and the result says so."""
         set_priority(1)
+        # ActivateAudioInterfaceAsync fails with 0x800401F0 (CO_E_NOTINITIALIZED) on a thread without COM: that made
+        # process loopback "refused" on every PC and silently recorded all PC sound.
+        com_ok = ctypes.windll.ole32.CoInitializeEx(None, 0) in (0, 1)  # multithreaded apartment; 1 = already inited
         out, stats, src, q = None, [0, 0], None, queue.Queue()  # stats: chunks, silent chunks
 
         def drain(timeout):
@@ -1306,6 +1317,8 @@ class Recorder:
                 out.pad_to(self.t())  # trailing silence: the file ends with the session
                 out.close()
                 self.audio_stats = (round(out.written / out.rate, 2), round(stats[1] / max(stats[0], 1), 3))
+            if com_ok:
+                ctypes.windll.ole32.CoUninitialize()
 
 
 # ---------------------------------------------------------------- UI
