@@ -278,3 +278,45 @@ def test_quality_jitter_and_needs_review():
     assert q["jitter_ms"]["p95"] > 200 / 30 and q["needs_review"] is True
     q, _ = quality(20, 30, [1] * 300, [0.01], [40.0], ev, 20.0, 0.1, 0, None)      # 15 fps real capture
     assert q["needs_review"] is True and "jitter_ms" not in q
+
+
+def test_audio_thread_stops_even_when_the_source_never_goes_quiet(tmp_path):
+    """Process loopback sends a (silent) packet every ~10 ms, so the audio queue is never empty. Stop must still end
+    the audio thread within seconds (it used to run for hours: 'drain until empty' never returned)."""
+    import threading
+    import time
+    pytest.importorskip("av")
+    import recorder as R
+
+    class Flood:  # a source that delivers 10 ms of silence every 5 ms, until stopped
+        rate, ch, name = 48000, 2, "flood"
+        err = None
+
+        def start(self, sink, clock):
+            self.ev = threading.Event()
+
+            def run():
+                while not self.ev.is_set():
+                    sink(clock(), np.zeros((480, 2), np.int16))
+                    time.sleep(0.005)
+            self.th = threading.Thread(target=run, daemon=True)
+            self.th.start()
+            return self
+
+        def stop(self):
+            self.ev.set()
+
+    rec = R.Recorder(tmp_path, 30, lambda: None)
+    rec.t0 = time.perf_counter()
+    orig = R.PcLoopback
+    R.PcLoopback = Flood
+    try:
+        th = threading.Thread(target=rec._game_audio, daemon=True)
+        th.start()
+        time.sleep(1.0)
+        rec.stop_ev.set()
+        th.join(10)
+        assert not th.is_alive(), "audio thread did not stop"
+    finally:
+        R.PcLoopback = orig
+    assert rec.audio_error is None and rec.audio_stats[0] >= 0.9   # ~1 s of audio, file closed properly

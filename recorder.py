@@ -40,7 +40,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.7"
+VERSION = "2.8"
 REPO = "Kem0wow/mito-recorder"  # public; each v* tag gets a release with MitoRecorder.exe (CI)
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 DRIVE_FOLDER_ID = "1g-eHWyhihvk86EOgC-639riVl9WZGBXo"
@@ -826,7 +826,7 @@ class ProcessLoopback:
             while not self.stop_ev.is_set():
                 if k32.WaitForSingleObject(self.ev, 100) != 0:  # WAIT_OBJECT_0 = data ready
                     continue
-                while True:
+                while not self.stop_ev.is_set():
                     n = ctypes.c_uint32()
                     _com(self.cap, 5, (ctypes.c_void_p, ctypes.addressof(n)))  # GetNextPacketSize
                     if n.value == 0:
@@ -1412,12 +1412,17 @@ class Recorder:
         com_ok = ctypes.windll.ole32.CoInitializeEx(None, 0) in (0, 1)  # multithreaded apartment; 1 = already inited
         out, stats, src, q = None, [0, 0], None, queue.Queue()  # stats: chunks, silent chunks
 
-        def drain(timeout):
-            while True:
+        def drain(final=False):
+            """Write queued chunks. Running: stop as soon as stop_ev is set (process loopback sends a silent packet
+            every ~10 ms, so the queue never stays empty and "until empty" never ends). final: only what is queued
+            right now, so a producer that is still running cannot keep this going."""
+            left = q.qsize()
+            while (left > 0) if final else not self.stop_ev.is_set():
                 try:
-                    t, a = q.get(timeout=timeout) if timeout else q.get_nowait()
+                    t, a = q.get_nowait() if final else q.get(timeout=0.2)
                 except queue.Empty:
                     return
+                left -= 1
                 stats[0] += 1
                 silent = int(a.min() > -8 and a.max() < 8)
                 stats[1] += silent
@@ -1439,9 +1444,9 @@ class Recorder:
                                "device_channels": src.ch, "codec": out.st.codec_context.name,
                                "bit_rate": AUDIO_BPS, "clock": "sample 0 = session t 0; silence padded"}
             while not self.stop_ev.is_set():
-                drain(0.2)
+                drain()
             src.stop()
-            drain(None)
+            drain(final=True)
             if getattr(src, "err", None):
                 self.audio_error = src.err
         except Exception as e:
