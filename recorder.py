@@ -42,7 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.9"
+VERSION = "3.0"
 REPO = "Kem0wow/mito-recorder"  # public; each v* tag gets a release with MitoRecorder.exe (CI)
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 DRIVE_FOLDER_ID = "1g-eHWyhihvk86EOgC-639riVl9WZGBXo"
