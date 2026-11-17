@@ -12,7 +12,7 @@ Releases: bump `VERSION` in `recorder.py`, commit, then push an annotated tag `v
 
 Recorded: the game window (720p max, 30 fps; video quality on the Record tab: Good = the standard, Light = same quality target for weak PCs: less CPU, bigger files), the **game's own sound** (only that program's audio, so voice chat and music apps are left out; if Windows cannot isolate it, all PC sound is recorded and the result says so), and keyboard + mouse **only while the game window is focused** (F9 is never logged).
 
-Inside each zip: `video.mp4` (fragmented, so a crash keeps it playable), `frames.csv` (with source-frame arrival time and a fresh/repeat flag), `inputs.jsonl` (Windows Raw Input, so mouse motion works in FPS games), `game_audio.ogg` (Opus, 96 kbps), `meta.json` (system info, your optional mouse DPI / sensitivity, a quality report with warnings). All share one clock; t = 0 is Start.
+Inside each zip: `video.mp4` (fragmented, so a crash keeps it playable), `frames.csv` (with source-frame arrival time and a fresh/repeat flag; if capture ran below 30 fps the missing slots are repeats, so the video always runs at exactly 30 fps on the session clock), `inputs.jsonl` (Windows Raw Input, so mouse motion works in FPS games), `game_audio.ogg` (Opus, 96 kbps), `profile.json` (light/good profile, 720p, constant 30 fps, real vs repeated frames, duration), `meta.json` (system info, your optional mouse DPI / sensitivity, a quality report with warnings). All share one clock; t = 0 is Start.
 
 While recording, a red or orange warning blinks when something is wrong (black video, low FPS, dropped frames, game not focused, no sound, no input, low disk). Click it to jump to the fix on the Instructions tab.
 

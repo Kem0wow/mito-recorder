@@ -3,6 +3,7 @@
 Each run becomes one zip in the save folder, named <Game>_<quality>_<duration>.zip (e.g. Minecraft_light_1h_2m_7s.zip), holding
   video.mp4        H.264 (x264 veryfast, CRF 20), scaled down to at most 720p, constant FPS (default 30)
   frames.csv       frame, t (grab time), src_t (source frame arrival), fresh (0 = repeat of the previous frame)
+  profile.json     light/good profile, 720p, constant 30 fps, real vs repeated frames, duration
   inputs.jsonl     keyboard + mouse from Windows Raw Input, logged only while the game window is focused,
                    plus focus / cursor-lock / window-move events
   game_audio.ogg   the game's own sound (per-process loopback; all PC sound if Windows refuses), Opus 96 kbps,
@@ -536,9 +537,15 @@ def zip_session(d, name=None):
     stem = name or d.name
     z = d.parent / f"{stem}.zip"
     tmp = d.parent / f"{stem}.zip.part"
-    with zipfile.ZipFile(tmp, "w") as zf:
+    # Big already-compressed files (video/audio) are stored, copied in 8 MB reads (zipfile's own write() uses 8 KB
+    # reads, which is slow for a multi-hundred-MB mp4). Small text files are deflated at level 1: fast, still small.
+    with zipfile.ZipFile(tmp, "w", compresslevel=1) as zf:
         for p in sorted(d.iterdir()):
-            zf.write(p, f"{stem}/{p.name}", zipfile.ZIP_STORED if p.suffix in STORED else zipfile.ZIP_DEFLATED)
+            zi = zipfile.ZipInfo.from_file(p, f"{stem}/{p.name}")
+            zi.compress_type = zipfile.ZIP_STORED if p.suffix in STORED else zipfile.ZIP_DEFLATED
+            with open(p, "rb", buffering=0) as src, zf.open(zi, "w", force_zip64=p.stat().st_size > 2**30) as dst:
+                while chunk := src.read(8 << 20):
+                    dst.write(chunk)
     tmp.replace(z)
     shutil.rmtree(d)
     return z
@@ -944,7 +951,8 @@ class Recorder:
         self.stop_ev, self.lock = threading.Event(), threading.Lock()
         self.q = queue.Queue(maxsize=fps)  # ~1 s of frames; full => drop, never stall capture
         self.eq = queue.Queue(maxsize=4)   # scaled 720p frames waiting for x264 (keeps full-res RAM bounded)
-        self.frames = self.dropped = 0
+        self.frames = self.dropped = 0  # frames = real captured frames; slots = frames in video.mp4 (incl. repeats)
+        self.slots, self.video_t0, self.t_end = 0, 0.0, None
         self.user, self.sysinfo, self.note = user or {}, system_info(), None
         self.down, self.focus, self.threads, self.fh = {}, None, [], None
         self.fresh, self.lags, self.bright, self.cstate, self.audio_stats = [], [], [], None, None
@@ -999,7 +1007,9 @@ class Recorder:
             warnings.append(self.note)
         meta = {"recorder": VERSION, "game": self.game, "window_title": self.title, "started": self.started,
                 "duration_s": round(dur, 3), "fps_requested": self.fps,
-                "fps_actual": round(self.frames / dur, 2) if dur else 0, "frames": self.frames,
+                "fps_actual": round(self.frames / dur, 2) if dur else 0,  # real captured frames per second
+                "frames": self.slots, "real_frames": self.frames, "repeated_frames": self.slots - self.frames,
+                "video_t0_s": round(self.video_t0, 4),
                 "dropped": self.dropped, "capture": self.backend, "region": self.region,
                 "video_size": list(self.vsize), "video": f"H.264 {self.x264}", "audio": self.audio_info,
                 "audio_error": self.audio_error,
@@ -1011,6 +1021,15 @@ class Recorder:
                           "window gained/lost focus (keys still held are released with forced=true).",
                 "error": self.error, "user": self.user, "system": self.sysinfo, "quality": q, "warnings": warnings}
         (self.out / "meta.json").write_text(json.dumps(meta, indent=1))
+        tag = quality_tag(self.x264)
+        profile = {"profile": tag, "cpu_load": "light" if tag == "light" else "heavy", "x264": self.x264,
+                   "duration_s": meta["duration_s"], "resolution": f"{self.vsize[1]}p",
+                   "video_size": list(self.vsize), "fps": self.fps, "fps_mode": "constant",
+                   "video_frames": self.slots, "real_frames": self.frames, "repeated_frames": self.slots - self.frames,
+                   "real_fps": meta["fps_actual"], "video_t0_s": meta["video_t0_s"],
+                   "frame_time": "frame k is at video_t0_s + k / fps on the session clock; repeated slots have fresh = 0 in frames.csv",
+                   "capture": self.backend, "recorder": VERSION}
+        (self.out / "profile.json").write_text(json.dumps(profile, indent=1))
         return meta
 
     # input (Raw Input thread)
@@ -1149,6 +1168,7 @@ class Recorder:
             self.error = f"capture: {e}"
             log(self.error)
         finally:
+            self.t_end = self.t()
             if close:
                 close()
             self.q.put(None)
@@ -1187,17 +1207,37 @@ class Recorder:
             wr = csv.writer(f)
             # t = session time we grabbed the frame; src_t = when the source frame arrived; fresh = 0 if repeated
             wr.writerow(["frame", "t", "src_t", "fresh"])
+            # Constant frame rate on the session clock: video frame k sits at video_t0 + k / fps. If capture ran
+            # slow (say 27 of 30 fps) the missing slots are filled with a repeat of the previous frame (fresh = 0),
+            # so the video is never shorter than the session and stays in sync with inputs.jsonl and the audio.
+            last = None  # (yuv frame, src_t) of the last real frame
+
+            def put(fr, t, src_t, fresh):
+                fr.pts = self.slots
+                c.mux(st.encode(fr))
+                wr.writerow([self.slots, f"{t:.4f}", f"{src_t:.4f}", fresh])
+                if self.slots % 30 == 0:
+                    f.flush()
+                self.slots += 1
+
             while (item := self.eq.get()) is not None:
                 t, fr, src_t, fresh = item
-                fr.pts = self.frames
-                c.mux(st.encode(fr))
-                wr.writerow([self.frames, f"{t:.4f}", f"{src_t:.4f}", fresh])
+                if last is None:
+                    self.video_t0 = t
+                target = round((t - self.video_t0) * self.fps)
+                while last and self.slots < target:
+                    put(last[0], self.video_t0 + self.slots / self.fps, last[1], 0)
+                if self.slots > target:
+                    continue  # two grabs rounded to one slot (timer jitter): keep the first
+                put(fr, t, src_t, fresh)
+                last = (fr, src_t)
+                self.frames += 1
                 self.fresh.append(fresh)
                 if fresh:
                     self.lags.append(t - src_t)
-                if self.frames % 30 == 0:
-                    f.flush()
-                self.frames += 1
+            if last and self.t_end is not None:  # trailing slots up to the end of the session
+                while self.slots < round((self.t_end - self.video_t0) * self.fps):
+                    put(last[0], self.video_t0 + self.slots / self.fps, last[1], 0)
             c.mux(st.encode())
 
     def _game_audio(self):
@@ -1476,8 +1516,7 @@ class App:
     def _finish(self, rec):
         try:
             meta = rec.stop()
-            z = zip_session(rec.out, free_zip_name(rec.out.parent, rec.game,
-                                                   f"{quality_tag(rec.x264)}_{duration_tag(meta['duration_s'])}"))
+            z = zip_session(rec.out, free_zip_name(rec.out.parent, rec.game, duration_tag(meta["duration_s"])))
             self.msg = (self.t("saved", name=z.name, minutes=meta["duration_s"] / 60, fps=meta["fps_actual"],
                                gb=z.stat().st_size / 1e9) + " " +
                         (self.t("warnings", w="; ".join(meta["warnings"])) if meta["warnings"] else self.t("quality_ok")) +
@@ -1688,7 +1727,7 @@ def selftest(a):
         log(f"WARNING: SendInput accepted {sent}/3 events (no interactive desktop?); input path untested")
     z = zip_session(d)
     names = zipfile.ZipFile(z).namelist()
-    need = [f"{d.name}/{n}" for n in ("video.mp4", "frames.csv", "inputs.jsonl", "meta.json")]
+    need = [f"{d.name}/{n}" for n in ("video.mp4", "frames.csv", "inputs.jsonl", "meta.json", "profile.json")]
     assert all(n in names for n in need), names
     log(f"zip {z.name} {z.stat().st_size / 1e6:.2f} MB for {meta['duration_s']} s at {meta['video_size']}: {names}")
     log("SELFTEST OK")
