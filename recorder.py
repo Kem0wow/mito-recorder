@@ -40,7 +40,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.8"
+VERSION = "2.9"
 REPO = "Kem0wow/mito-recorder"  # public; each v* tag gets a release with MitoRecorder.exe (CI)
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 DRIVE_FOLDER_ID = "1g-eHWyhihvk86EOgC-639riVl9WZGBXo"
@@ -586,7 +586,7 @@ def zip_session(d, name=None):
     # reads, which is slow for a multi-hundred-MB mp4). Small text files are deflated at level 1: fast, still small.
     with zipfile.ZipFile(tmp, "w", compresslevel=1) as zf:
         for p in sorted(d.iterdir()):
-            zi = zipfile.ZipInfo.from_file(p, f"{stem}/{p.name}")
+            zi = zipfile.ZipInfo.from_file(p, p.name)
             zi.compress_type = zipfile.ZIP_STORED if p.suffix in STORED else zipfile.ZIP_DEFLATED
             with open(p, "rb", buffering=0) as src, zf.open(zi, "w", force_zip64=p.stat().st_size > 2**30) as dst:
                 while chunk := src.read(8 << 20):
@@ -623,10 +623,10 @@ def _part_crc(part):
     return n, crc
 
 
-def video_entry(stem, size, crc):
-    """(ZipInfo, local header bytes) of <stem>/video.mp4 stored at offset 0. The header is padded with an unknown
+def video_entry(size, crc):
+    """(ZipInfo, local header bytes) of video.mp4 (at the zip root) stored at offset 0. The header is padded with an unknown
     extra field to exactly ZIP_HDR bytes; zip64 fields are added by zipfile when size >= 4 GiB."""
-    zi = zipfile.ZipInfo(f"{stem}/video.mp4", time.localtime()[:6])
+    zi = zipfile.ZipInfo("video.mp4", time.localtime()[:6])
     zi.compress_type, zi.file_size, zi.compress_size, zi.CRC = zipfile.ZIP_STORED, size, size, crc
     zi.header_offset, zi.external_attr = 0, 0o100644 << 16
     pad = ZIP_HDR - len(zi.FileHeader())
@@ -647,7 +647,7 @@ def finalize_zip(part, d, name=None, size=None, crc=None):
     stem = name or d.name
     if size is None or crc is None:  # crash recovery: nobody counted while the video was written
         size, crc = _part_crc(part)
-    zi, header = video_entry(stem, size, crc)
+    zi, header = video_entry(size, crc)
     z = part.parent / f"{stem}.zip"
     with open(part, "r+b") as fp:
         if fp.seek(0, 2) != ZIP_HDR + size:
@@ -660,7 +660,7 @@ def finalize_zip(part, d, name=None, size=None, crc=None):
             zf.NameToInfo[zi.filename] = zi
             for p in sorted(d.iterdir()) if d.is_dir() else []:
                 if p.name != "video.mp4":
-                    zi2 = zipfile.ZipInfo.from_file(p, f"{stem}/{p.name}")
+                    zi2 = zipfile.ZipInfo.from_file(p, p.name)
                     zi2.compress_type = zipfile.ZIP_STORED if p.suffix in STORED else zipfile.ZIP_DEFLATED
                     with open(p, "rb", buffering=0) as src, zf.open(zi2, "w") as dst:
                         while chunk := src.read(8 << 20):
@@ -1895,8 +1895,8 @@ def selftest(a):
     z = rec.package(d.name)  # zero-copy zip: the video is read back out of the finished zip
     with zipfile.ZipFile(z) as zf:
         assert zf.testzip() is None
-        zf.extract(f"{d.name}/video.mp4", root / "x")
-    with av.open(str(root / "x" / d.name / "video.mp4")) as c:  # the fragmented mp4 must decode completely
+        zf.extract("video.mp4", root / "x")
+    with av.open(str(root / "x" / "video.mp4")) as c:  # the fragmented mp4 must decode completely
         n = sum(1 for _ in c.decode(video=0))
     assert abs(n - meta["frames"]) <= 1, (n, meta["frames"])
     d.mkdir(exist_ok=True)  # frames.csv & co. were packed into the zip; unpack them for the checks below
@@ -1920,7 +1920,7 @@ def selftest(a):
     else:
         log(f"WARNING: SendInput accepted {sent}/3 events (no interactive desktop?); input path untested")
     names = zipfile.ZipFile(z).namelist()
-    need = [f"{d.name}/{n}" for n in ("video.mp4", "frames.csv", "inputs.jsonl", "meta.json", "profile.json")]
+    need = ["video.mp4", "frames.csv", "inputs.jsonl", "meta.json", "profile.json"]
     assert all(n in names for n in need), names
     log(f"zip {z.name} {z.stat().st_size / 1e6:.2f} MB for {meta['duration_s']} s at {meta['video_size']}: {names}")
     log("SELFTEST OK")

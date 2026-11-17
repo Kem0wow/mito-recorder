@@ -62,7 +62,7 @@ def test_zip_session(tmp_path):
     assert z.name == "Game 1.5_2.zip" and not d.exists()
     with zipfile.ZipFile(z) as zf:
         info = {i.filename: i.compress_type for i in zf.infolist()}
-    assert info == {"Game 1.5_2/inputs.jsonl": zipfile.ZIP_DEFLATED, "Game 1.5_2/video.mp4": zipfile.ZIP_STORED}
+    assert info == {"inputs.jsonl": zipfile.ZIP_DEFLATED, "video.mp4": zipfile.ZIP_STORED}  # flat: no folder inside
 
 
 def test_audio_out_keeps_session_clock(tmp_path):
@@ -214,8 +214,8 @@ def test_encoder_zero_copy_streams_into_zip_part(tmp_path):
     z = rec.package("Game_3s")
     with zipfile.ZipFile(z) as zf:
         assert zf.testzip() is None
-        assert zf.read("Game_3s/video.mp4") == raw[ZIP_HDR:]
-        assert "Game_3s/frames.csv" in zf.namelist()
+        assert zf.read("video.mp4") == raw[ZIP_HDR:]
+        assert "frames.csv" in zf.namelist()
     assert not d.exists() and not rec.part.exists()
 
 
@@ -235,20 +235,19 @@ def test_finalize_zip_is_a_valid_zip_without_copying(tmp_path):
     with zipfile.ZipFile(z) as zf:
         assert zf.testzip() is None
         info = {i.filename: i.compress_type for i in zf.infolist()}
-        assert info == {"Çılgın Oyun_1m_5s/video.mp4": zipfile.ZIP_STORED,
-                        "Çılgın Oyun_1m_5s/inputs.jsonl": zipfile.ZIP_DEFLATED,
-                        "Çılgın Oyun_1m_5s/game_audio.ogg": zipfile.ZIP_STORED}
-        assert zf.read("Çılgın Oyun_1m_5s/video.mp4") == video
-        assert zf.read("Çılgın Oyun_1m_5s/inputs.jsonl").startswith(b'{"t": 0}')
+        assert info == {"video.mp4": zipfile.ZIP_STORED, "inputs.jsonl": zipfile.ZIP_DEFLATED,
+                        "game_audio.ogg": zipfile.ZIP_STORED}   # flat: files sit at the zip root, no folder inside
+        assert zf.read("video.mp4") == video
+        assert zf.read("inputs.jsonl").startswith(b'{"t": 0}')
     assert z.stat().st_size < len(video) + 20_000   # the video exists once, the zip adds only headers + small files
 
 
 def test_video_entry_header_always_fills_the_gap_even_for_zip64_sizes():
     from recorder import ZIP_HDR, video_entry
     for size in (0, 1234, 2**32 - 2, 2**32 + 5, 40 * 2**30):
-        zi, header = video_entry("Çılgın Oyun_12h_30m_5s_2", size, 0xDEADBEEF)
+        zi, header = video_entry(size, 0xDEADBEEF)
         assert len(header) == ZIP_HDR and zi.extra == b"" and zi.file_size == size
-    big = video_entry("g", 5 * 2**30, 1)[1]
+    big = video_entry(5 * 2**30, 1)[1]
     assert big[4:6] == (45).to_bytes(2, "little")      # zip64 needs version 4.5
 
 
@@ -264,7 +263,7 @@ def test_recover_parts_after_a_crash(tmp_path):
     out = recover_parts(tmp_path)
     assert [z.name for z in out] == ["Game_3_recovered.zip"]
     with zipfile.ZipFile(out[0]) as zf:
-        assert zf.testzip() is None and zf.read("Game_3_recovered/video.mp4") == video
+        assert zf.testzip() is None and zf.read("video.mp4") == video
     assert not list(tmp_path.glob("*.part"))
 
 

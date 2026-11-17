@@ -8,6 +8,8 @@ Players never label anything. Nothing in the recorder asks them to.
 
 One zip per session, from `mito-recorder` (`<Game>_<duration>.zip`):
 
+From v2.9 the files sit directly at the zip root. Zips from v2.8 and older keep them inside one folder named like the zip (`<Game>_<duration>/video.mp4`): the reader must accept both (match on the file name, ignore the folder).
+
 | File | Use in the pipeline |
 |---|---|
 | `video.mp4` | 720p max, constant 24 / 30 / 36 fps (`profile.json` `fps`), H.264 veryfast CRF 20 (Light: ultrafast), GOP 2 s (cheap random access). **Video time = session time**: frame k is at `k/30` s, so `t * fps` is the frame index (sample by time `t`, not by a fixed frame step: 24 fps does not divide into 9 fps groups). Slots the PC could not capture are repeats of the previous frame |
