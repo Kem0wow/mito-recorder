@@ -10,7 +10,7 @@ One zip per session, from `mito-recorder` (`<Game>_<duration>.zip`):
 
 | File | Use in the pipeline |
 |---|---|
-| `video.mp4` | 720p max, constant 30 fps, H.264 veryfast CRF 20 (Light: ultrafast), GOP 2 s (cheap random access). **Video time = session time**: frame k is at `k/30` s, so `t * 30` is the frame index. Slots the PC could not capture are repeats of the previous frame |
+| `video.mp4` | 720p max, constant 24 / 30 / 36 fps (`profile.json` `fps`), H.264 veryfast CRF 20 (Light: ultrafast), GOP 2 s (cheap random access). **Video time = session time**: frame k is at `k/30` s, so `t * fps` is the frame index (sample by time `t`, not by a fixed frame step: 24 fps does not divide into 9 fps groups). Slots the PC could not capture are repeats of the previous frame |
 | `frames.csv` | one row per video frame: frame index, session time `t`, source time `src_t`, `fresh` (0 = repeated frame, ignore for labels) |
 | `profile.json` | `profile` (good / light), `cpu_load`, resolution, fps, `video_frames`, `real_frames`, `repeated_frames`, `real_fps`. Use it to keep light or low-fps sessions out of focus/OCR labels |
 | `inputs.jsonl` | keyboard, mouse buttons, scroll, raw mouse motion (`move`), cursor lock (`cursor`), `focus`, `region`. Sorted by `t`. Session clock. |

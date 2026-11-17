@@ -12,7 +12,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt pyinstaller pytest
+      - run: pip install -r requirements.txt "pyinstaller>=6.9" pytest
       - run: pip install --no-deps windows-capture  # its opencv dependency is unused, kept out of the exe
       - run: pytest -q test_recorder.py
       - name: Write Drive key from secret (never committed)
@@ -29,9 +29,11 @@ jobs:
       - name: Selftest the built exe (capture + raw input + encode + zip)
         shell: pwsh
         run: |
-          $p = Start-Process dist\MitoRecorder.exe -ArgumentList "--selftest","st","--seconds","4" -Wait -PassThru
-          Get-Content "$env:USERPROFILE\MitoRecorder.log"
-          exit $p.ExitCode
+          foreach ($fps in 24, 30, 36) {
+            $p = Start-Process dist\MitoRecorder.exe -ArgumentList "--selftest","st$fps","--seconds","4","--fps","$fps" -Wait -PassThru
+            Get-Content "$env:USERPROFILE\MitoRecorder.log" -Tail 30
+            if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+          }
       - name: UI smoke test (window builds, Raw Input starts)
         shell: pwsh
         run: |

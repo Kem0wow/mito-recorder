@@ -160,15 +160,17 @@ def test_self_update_pieces(tmp_path):
     assert exe.read_bytes() == b"new build" and old.read_bytes() == b"old build" and not new.exists()
 
 
-def test_encoder_keeps_constant_30fps_when_capture_is_slow(tmp_path):
-    """27 fps capture with a 1 s stall still gives a 30 fps video as long as the session (repeats fill the gaps)."""
+@pytest.mark.parametrize("fps", [24, 30, 36])
+def test_encoder_keeps_constant_fps_when_capture_is_slow(tmp_path, fps):
+    """Capture at 90% of fps with a 1 s stall still gives a video that is exactly the session long, at the chosen fps."""
     import csv
     import threading
     av = pytest.importorskip("av")
     from recorder import Recorder
-    rec = Recorder(tmp_path, 30, lambda: None)
+    rec = Recorder(tmp_path, fps, lambda: None)
     rec.vsize, rec.t_end = (320, 180), 12.0
-    ts = [i / 27 for i in range(270) if not 4 < i / 27 < 5]
+    rate = 0.9 * fps
+    ts = [i / rate for i in range(int(10 * rate)) if not 4 < i / rate < 5]
 
     def feed():
         for i, t in enumerate(ts):
@@ -179,9 +181,100 @@ def test_encoder_keeps_constant_30fps_when_capture_is_slow(tmp_path):
     threading.Thread(target=feed, daemon=True).start()
     rec._encode()
     rows = list(csv.DictReader(open(tmp_path / "frames.csv")))
-    assert rec.slots == len(rows) == 360                     # 12 s session * 30 fps, video time = session time
-    assert rows[0]["fresh"] == "0" and float(rows[0]["t"]) == 0.0   # slots before the first capture repeat it
-    assert rec.frames == len(ts) and rec.slots - rec.frames == 360 - len(ts)
-    assert sum(r["fresh"] == "0" for r in rows) >= rec.slots - rec.frames
+    assert rec.slots == len(rows) == 12 * fps              # video time = session time
+    assert rows[0]["fresh"] == "0" and float(rows[0]["t"]) == 0.0
+    assert rec.frames == len(ts) and rec.slots - rec.frames == 12 * fps - len(ts)
     with av.open(str(tmp_path / "video.mp4")) as c:
-        assert sum(1 for _ in c.decode(video=0)) == 360
+        assert c.streams.video[0].average_rate == fps
+        assert sum(1 for _ in c.decode(video=0)) == 12 * fps
+
+
+def test_encoder_zero_copy_streams_into_zip_part(tmp_path):
+    """zero_copy: the mp4 lands in <out>.zip.part after the 512 B gap, with its CRC and size counted on the way."""
+    import threading
+    import zlib
+    av = pytest.importorskip("av")
+    from recorder import Recorder, ZIP_HDR
+    d = tmp_path / "Game_1"
+    d.mkdir()
+    rec = Recorder(d, 30, lambda: None, zero_copy=True)
+    rec.vsize, rec.t_end = (320, 180), 3.0
+
+    def feed():
+        for i in range(60):
+            img = np.full((180, 320, 3), i * 3 % 255, np.uint8)
+            rec.eq.put((i / 30, av.VideoFrame.from_ndarray(img, format="rgb24").reformat(format="yuv420p"), i / 30, 1))
+        rec.eq.put(None)
+
+    threading.Thread(target=feed, daemon=True).start()
+    rec._encode()
+    raw = rec.part.read_bytes()
+    assert raw[:ZIP_HDR] == bytes(ZIP_HDR) and len(raw) == ZIP_HDR + rec.video_bytes
+    assert zlib.crc32(raw[ZIP_HDR:]) == rec.video_crc
+    z = rec.package("Game_3s")
+    with zipfile.ZipFile(z) as zf:
+        assert zf.testzip() is None
+        assert zf.read("Game_3s/video.mp4") == raw[ZIP_HDR:]
+        assert "Game_3s/frames.csv" in zf.namelist()
+    assert not d.exists() and not rec.part.exists()
+
+
+def test_finalize_zip_is_a_valid_zip_without_copying(tmp_path):
+    import os
+    import zlib
+    from recorder import ZIP_HDR, finalize_zip
+    d = tmp_path / "Çılgın Oyun_2"
+    d.mkdir()
+    (d / "inputs.jsonl").write_text('{"t": 0}\n' * 100)
+    (d / "game_audio.ogg").write_bytes(os.urandom(5000))
+    video = os.urandom(3_000_000)
+    part = tmp_path / "Çılgın Oyun_2.zip.part"
+    part.write_bytes(bytes(ZIP_HDR) + video)
+    z = finalize_zip(part, d, "Çılgın Oyun_1m_5s", len(video), zlib.crc32(video))
+    assert z.name == "Çılgın Oyun_1m_5s.zip" and not d.exists() and not part.exists()
+    with zipfile.ZipFile(z) as zf:
+        assert zf.testzip() is None
+        info = {i.filename: i.compress_type for i in zf.infolist()}
+        assert info == {"Çılgın Oyun_1m_5s/video.mp4": zipfile.ZIP_STORED,
+                        "Çılgın Oyun_1m_5s/inputs.jsonl": zipfile.ZIP_DEFLATED,
+                        "Çılgın Oyun_1m_5s/game_audio.ogg": zipfile.ZIP_STORED}
+        assert zf.read("Çılgın Oyun_1m_5s/video.mp4") == video
+        assert zf.read("Çılgın Oyun_1m_5s/inputs.jsonl").startswith(b'{"t": 0}')
+    assert z.stat().st_size < len(video) + 20_000   # the video exists once, the zip adds only headers + small files
+
+
+def test_video_entry_header_always_fills_the_gap_even_for_zip64_sizes():
+    from recorder import ZIP_HDR, video_entry
+    for size in (0, 1234, 2**32 - 2, 2**32 + 5, 40 * 2**30):
+        zi, header = video_entry("Çılgın Oyun_12h_30m_5s_2", size, 0xDEADBEEF)
+        assert len(header) == ZIP_HDR and zi.extra == b"" and zi.file_size == size
+    big = video_entry("g", 5 * 2**30, 1)[1]
+    assert big[4:6] == (45).to_bytes(2, "little")      # zip64 needs version 4.5
+
+
+def test_recover_parts_after_a_crash(tmp_path):
+    import os
+    from recorder import ZIP_HDR, recover_parts
+    d = tmp_path / "Game_3"
+    d.mkdir()
+    (d / "inputs.jsonl").write_text("{}\n")
+    video = os.urandom(100_000)
+    (tmp_path / "Game_3.zip.part").write_bytes(bytes(ZIP_HDR) + video)   # no CRC was ever stored: recovery recomputes it
+    (tmp_path / "Empty_1.zip.part").write_bytes(bytes(ZIP_HDR))           # nothing recorded: dropped
+    out = recover_parts(tmp_path)
+    assert [z.name for z in out] == ["Game_3_recovered.zip"]
+    with zipfile.ZipFile(out[0]) as zf:
+        assert zf.testzip() is None and zf.read("Game_3_recovered/video.mp4") == video
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_quality_jitter_and_needs_review():
+    ev = [{"kind": "move", "t": 1}]
+    smooth = [i / 30 for i in range(600)]
+    q, _ = quality(20, 30, [1] * 600, [0.01], [40.0], ev, 20.0, 0.1, 0, smooth)
+    assert q["jitter_ms"]["p95"] < 1 and q["needs_review"] is False
+    wobbly = [t + (0.02 if i % 2 else 0) for i, t in enumerate(smooth)]   # +-20 ms >> 0.2 / fps = 6.7 ms
+    q, _ = quality(20, 30, [1] * 600, [0.01], [40.0], ev, 20.0, 0.1, 0, wobbly)
+    assert q["jitter_ms"]["p95"] > 200 / 30 and q["needs_review"] is True
+    q, _ = quality(20, 30, [1] * 300, [0.01], [40.0], ev, 20.0, 0.1, 0, None)      # 15 fps real capture
+    assert q["needs_review"] is True and "jitter_ms" not in q

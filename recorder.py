@@ -1,7 +1,7 @@
 """Mito Recorder: record gameplay as training data for a game-playing AI (VLA).
 
 Each run becomes one zip in the save folder, named <Game>_<quality>_<duration>.zip (e.g. Minecraft_light_1h_2m_7s.zip), holding
-  video.mp4        H.264 (x264 veryfast, CRF 20), scaled down to at most 720p, constant FPS (default 30)
+  video.mp4        H.264 (x264 veryfast, CRF 20), scaled down to at most 720p, constant FPS (24, 30 or 36; default 30)
   frames.csv       frame, t (grab time), src_t (source frame arrival), fresh (0 = repeat of the previous frame)
   profile.json     light/good profile, 720p, constant 30 fps, real vs repeated frames, duration
   inputs.jsonl     keyboard + mouse from Windows Raw Input, logged only while the game window is focused,
@@ -34,12 +34,13 @@ import time
 import types
 import webbrowser
 import zipfile
+import zlib
 from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 
-VERSION = "2.6"
+VERSION = "2.7"
 REPO = "Kem0wow/mito-recorder"  # public; each v* tag gets a release with MitoRecorder.exe (CI)
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 DRIVE_FOLDER_ID = "1g-eHWyhihvk86EOgC-639riVl9WZGBXo"
@@ -58,6 +59,7 @@ STR = {
  "upd_recording": "Stop the recording first.", "upd_notexe": "Only the .exe can update itself.",
  "upd_err": "Update check failed: {err}", "upd_notes": "What's new:",
  "game_window": "Game window", "refresh": "Refresh", "game_name": "Game name", "fps": "FPS",
+ "fps_hint": "36 needs a stronger PC; if 'Low FPS' shows, pick 24 or 30",
  "dpi": "Mouse DPI (optional)", "sens": "Game sensitivity (optional)", "quality": "Video quality",
  "save_to": "Save to", "browse": "Browse", "start": "Start (F9)", "stop": "Stop (F9)", "saving": "Saving...",
  "idle": "Pick the game window, then press Start (or F9 in game).",
@@ -115,6 +117,7 @@ STR = {
  "upd_recording": "Önce kaydı durdur.", "upd_notexe": "Sadece .exe kendini güncelleyebilir.",
  "upd_err": "Güncelleme kontrolü başarısız: {err}", "upd_notes": "Yenilikler:",
  "game_window": "Oyun penceresi", "refresh": "Yenile", "game_name": "Oyun adı", "fps": "FPS",
+ "fps_hint": "36 daha güçlü PC ister; 'Düşük FPS' çıkarsa 24 veya 30 seç",
  "dpi": "Mouse DPI (isteğe bağlı)", "sens": "Oyun hassasiyeti (isteğe bağlı)", "quality": "Video kalitesi",
  "save_to": "Kayıt klasörü", "browse": "Gözat", "start": "Başlat (F9)", "stop": "Durdur (F9)",
  "saving": "Kaydediliyor...",
@@ -174,7 +177,9 @@ def tr(key, lang="en", **kw):
 
 
 IS_WIN = sys.platform == "win32"
-FPS = 30  # fixed, not user-editable: training samples 6 or 9 fps groups from it
+FPS_CHOICES = (24, 30, 36)  # Record-tab combobox; the pipeline samples by session time t, never by frame index
+FPS_DEFAULT = 30
+FPS = FPS_DEFAULT  # selftest / headless default
 MIN_FREE = 3e9   # refuse to start with less free disk than this
 LOW_FREE = 5e8   # stop (and save) a running session below this
 MAX_H = 720
@@ -256,10 +261,11 @@ def audio_pad(written, t, n, rate, tol=0.03):
     return gap if gap > tol * rate else 0
 
 
-def quality(dur, fps, fresh, lags, bright, events, audio_s, silent, dropped):
+def quality(dur, fps, fresh, lags, bright, events, audio_s, silent, dropped, times=None):
     """Health numbers + human warnings for one session.
     fresh: 0/1 per frame (1 = a new source frame); lags: s between source frame arrival and our grab (fresh frames);
-    bright: sampled mean pixel values; events: input dicts; audio_s/silent: file seconds, share of silent chunks."""
+    bright: sampled mean pixel values; events: input dicts; audio_s/silent: file seconds, share of silent chunks;
+    times: session time of every really captured frame (for the interval jitter)."""
     n, on, last, kinds = len(fresh), 0.0, None, {}
     for e in events:
         kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
@@ -275,6 +281,10 @@ def quality(dur, fps, fresh, lags, bright, events, audio_s, silent, dropped):
          "black_share": round(sum(b < 3 for b in bright) / len(bright), 3) if bright else None,
          "focused_s": round(on, 1), "input_events": kinds, "audio_s": audio_s, "audio_silent_share": silent,
          "dropped": dropped}
+    if times and len(times) > 2:  # |capture interval - 1/fps|: how far the grabs wobble around the 30 fps grid
+        dev = sorted(abs(b - a - 1 / fps) * 1000 for a, b in zip(times, times[1:]))
+        q["jitter_ms"] = {"p50": round(dev[len(dev) // 2], 2), "p95": round(dev[int(0.95 * (len(dev) - 1))], 2),
+                          "max": round(dev[-1], 2)}
     w = []
     if q["black_share"] and q["black_share"] > 0.5:
         w.append("video is mostly black: run the game in windowed or borderless mode")
@@ -290,6 +300,10 @@ def quality(dur, fps, fresh, lags, bright, events, audio_s, silent, dropped):
         w.append("the game window was focused less than half of the time")
     if dur > 10 and not any(k in kinds for k in ("key_down", "mouse_down", "move")):
         w.append("no keyboard or mouse input recorded")
+    # flagged for a human look, never deleted: bad video timing, many drops, black picture or a very short session
+    q["needs_review"] = bool(
+        (dur and q["fps"] < 0.9 * fps) or dropped > 0.01 * max(n, 1) or (q["black_share"] or 0) > 0.5
+        or (q.get("jitter_ms") and q["jitter_ms"]["p95"] > 200 / fps) or 0 < dur < 5)
     return q, w
 
 
@@ -486,13 +500,23 @@ def swap_exe(exe, new):
     return old
 
 
+def fresh_env(**extra):
+    """Environment for starting this exe again as its own top-level process. A onefile PyInstaller exe that starts
+    the same exe path inherits the parent's temp dir (_MEI...), which is deleted when the parent exits: the new
+    process then dies with "No module named '_tkinter'". PYINSTALLER_RESET_ENVIRONMENT makes it extract its own."""
+    env = {k: v for k, v in os.environ.items() if k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    env.update(extra)
+    return env
+
+
 def apply_update(info, exe=None, relaunch=()):
     """Download + verify + swap the running exe, start the new one. Returns the new process."""
     exe = Path(exe or sys.executable)
     new = download_verified(info["url"], info["sha256"], exe.with_name(exe.stem + ".new.exe"))
     swap_exe(exe, new)
     log(f"updated {exe.name} to {info['tag']}")
-    return subprocess.Popen([str(exe), *relaunch])
+    return subprocess.Popen([str(exe), *relaunch], env=fresh_env())
 
 
 def cleanup_old_exe(wait_s=30.0):
@@ -570,6 +594,98 @@ def zip_session(d, name=None):
     tmp.replace(z)
     shutil.rmtree(d)
     return z
+
+
+ZIP_HDR = 512  # bytes reserved at the start of <name>.zip.part for video.mp4's zip local header
+
+
+class CrcFile:
+    """Write-only file for PyAV: counts bytes and CRC32 while video.mp4 streams straight into the zip."""
+
+    def __init__(self, f):
+        self.f, self.crc, self.n = f, 0, 0
+
+    def write(self, b):
+        self.crc = zlib.crc32(b, self.crc)
+        self.n += len(b)
+        return self.f.write(b)
+
+    def flush(self):
+        self.f.flush()
+
+
+def _part_crc(part):
+    crc, n = 0, 0
+    with open(part, "rb") as f:
+        f.seek(ZIP_HDR)
+        while chunk := f.read(8 << 20):
+            crc, n = zlib.crc32(chunk, crc), n + len(chunk)
+    return n, crc
+
+
+def video_entry(stem, size, crc):
+    """(ZipInfo, local header bytes) of <stem>/video.mp4 stored at offset 0. The header is padded with an unknown
+    extra field to exactly ZIP_HDR bytes; zip64 fields are added by zipfile when size >= 4 GiB."""
+    zi = zipfile.ZipInfo(f"{stem}/video.mp4", time.localtime()[:6])
+    zi.compress_type, zi.file_size, zi.compress_size, zi.CRC = zipfile.ZIP_STORED, size, size, crc
+    zi.header_offset, zi.external_attr = 0, 0o100644 << 16
+    pad = ZIP_HDR - len(zi.FileHeader())
+    if pad < 4:
+        raise ValueError("zip entry name too long")
+    zi.extra = struct.pack("<HH", 0xCAFE, pad - 4) + bytes(pad - 4)
+    header = zi.FileHeader()
+    assert len(header) == ZIP_HDR, (len(header), pad)
+    zi.extra = b""  # the padding belongs to the local header only
+    return zi, header
+
+
+def finalize_zip(part, d, name=None, size=None, crc=None):
+    """<name>.zip.part (512 B gap + video.mp4 bytes) + the small files in session dir d -> <name>.zip, folder removed.
+    The video is NOT copied: its zip header is written into the gap and the rest is appended after it, so the
+    disk never holds two copies and finishing takes about as long as writing the small files."""
+    part, d = Path(part), Path(d)
+    stem = name or d.name
+    if size is None or crc is None:  # crash recovery: nobody counted while the video was written
+        size, crc = _part_crc(part)
+    zi, header = video_entry(stem, size, crc)
+    z = part.parent / f"{stem}.zip"
+    with open(part, "r+b") as fp:
+        if fp.seek(0, 2) != ZIP_HDR + size:
+            raise OSError("video part has the wrong size")
+        fp.seek(0)
+        fp.write(header)
+        fp.seek(ZIP_HDR + size)
+        with zipfile.ZipFile(fp, "w", compresslevel=1) as zf:  # continues after the video bytes
+            zf.filelist.append(zi)
+            zf.NameToInfo[zi.filename] = zi
+            for p in sorted(d.iterdir()) if d.is_dir() else []:
+                if p.name != "video.mp4":
+                    zi2 = zipfile.ZipInfo.from_file(p, f"{stem}/{p.name}")
+                    zi2.compress_type = zipfile.ZIP_STORED if p.suffix in STORED else zipfile.ZIP_DEFLATED
+                    with open(p, "rb", buffering=0) as src, zf.open(zi2, "w") as dst:
+                        while chunk := src.read(8 << 20):
+                            dst.write(chunk)
+    part.replace(z)
+    shutil.rmtree(d, ignore_errors=True)
+    return z
+
+
+def recover_parts(root):
+    """A crash or power loss leaves <game>_N.zip.part (a playable fragmented mp4 inside) + the <game>_N folder:
+    turn each into <game>_N_recovered.zip. Never touches a part that is being written (call before recording)."""
+    out = []
+    root = Path(root)
+    for part in sorted(root.glob("*.zip.part")) if root.is_dir() else []:
+        try:
+            if part.stat().st_size <= ZIP_HDR:
+                part.unlink()
+                continue
+            stem = part.name[:-len(".zip.part")]
+            out.append(finalize_zip(part, root / stem, free_zip_name(root, stem, "recovered")))
+            log(f"recovered {out[-1].name}")
+        except Exception as e:
+            log(f"could not recover {part.name}: {e!r}")
+    return out
 
 
 class AudioOut:
@@ -961,10 +1077,12 @@ class RawInput:
 # ---------------------------------------------------------------- recorder
 
 class Recorder:
-    def __init__(self, out, fps, region_fn, target=None, hwnd=None, game="", title="", audio=True, user=None, pid=None, x264=None):
+    def __init__(self, out, fps, region_fn, target=None, hwnd=None, game="", title="", audio=True, user=None, pid=None, x264=None,
+                 zero_copy=False):
         """target: ("window", hwnd) | ("monitor", 1-based index) for Windows Graphics Capture; None = GDI/mss.
         hwnd: inputs are kept only while this window is in the foreground (None = always).
-        pid: the game's process; its sound only (None = all PC sound)."""
+        pid: the game's process; its sound only (None = all PC sound).
+        zero_copy: video.mp4 streams straight into <out>.zip.part (see finalize_zip) instead of a file in out."""
         self.out, self.fps, self.region_fn = Path(out), fps, region_fn
         self.target, self.hwnd, self.game, self.title, self.audio = target, hwnd, game, title, audio
         self.pid = pid
@@ -976,6 +1094,9 @@ class Recorder:
         self.eq = queue.Queue(maxsize=4)   # scaled 720p frames waiting for x264 (keeps full-res RAM bounded)
         self.frames = self.dropped = 0  # frames = real captured frames; slots = frames in video.mp4 (incl. repeats)
         self.slots, self.video_t0, self.t_end = 0, 0.0, None
+        self.part = self.out.parent / f"{self.out.name}.zip.part" if zero_copy else None
+        self.video_bytes = self.video_crc = None
+        self.real_t = []  # session time of every really captured frame (jitter)
         self.user, self.sysinfo, self.note = user or {}, system_info(), None
         self.down, self.focus, self.threads, self.fh = {}, None, [], None
         self.fresh, self.lags, self.bright, self.cstate, self.audio_stats = [], [], [], None, None
@@ -1021,7 +1142,7 @@ class Recorder:
         events = sorted((json.loads(x) for x in open(p, encoding="utf-8")), key=lambda e: e["t"])
         p.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
         q, warnings = quality(dur, self.fps, self.fresh, self.lags, self.bright, events,
-                              *(self.audio_stats or (None, None)), self.dropped)
+                              *(self.audio_stats or (None, None)), self.dropped, self.real_t)
         if self.audio_error:
             warnings = [w for w in warnings if w != "no game audio recorded"] + [f"game audio failed: {self.audio_error}"]
         if self.audio_note:
@@ -1054,6 +1175,12 @@ class Recorder:
                    "capture": self.backend, "recorder": VERSION}
         (self.out / "profile.json").write_text(json.dumps(profile, indent=1))
         return meta
+
+    def package(self, name):
+        """Zip name -> path of the finished <name>.zip (zero-copy when the video was streamed into a .part)."""
+        if self.part:
+            return finalize_zip(self.part, self.out, name, self.video_bytes, self.video_crc)
+        return zip_session(self.out, name)
 
     # input (Raw Input thread)
     def _log(self, t, ev):  # caller holds self.lock
@@ -1217,11 +1344,20 @@ class Recorder:
             self.eq.put(None)
 
     def _encode(self):
+        if not self.part:
+            return self._encode_to(str(self.out / "video.mp4"))
+        with open(self.part, "wb") as sink:  # zero-copy zip: gap for the zip header, then the mp4 bytes
+            sink.write(bytes(ZIP_HDR))
+            dest = CrcFile(sink)
+            self._encode_to(dest)
+            self.video_bytes, self.video_crc = dest.n, dest.crc
+
+    def _encode_to(self, dest):
         import av
         set_priority(-1)
         w, h = self.vsize
         # fragmented mp4: a crash or power loss leaves a playable file
-        with av.open(str(self.out / "video.mp4"), "w",
+        with av.open(dest, "w", format="mp4",
                      options={"movflags": "frag_keyframe+empty_moov+default_base_moof"}) as c, \
                 open(self.out / "frames.csv", "w", newline="") as f:
             try:  # GOP 2 s: cheap random access when sampling frames for training
@@ -1259,6 +1395,7 @@ class Recorder:
                 put(fr, t, src_t, fresh)
                 last = (fr, src_t)
                 self.frames += 1
+                self.real_t.append(t)
                 self.fresh.append(fresh)
                 if fresh:
                     self.lags.append(t - src_t)
@@ -1342,6 +1479,7 @@ class App:
         self.game = tk.StringVar()
         self.dpi, self.sens = tk.StringVar(), tk.StringVar()
         self.quality = tk.StringVar(value=X264_DEFAULT)
+        self.fps_var = tk.StringVar(value=str(FPS_DEFAULT))
         self.out = tk.StringVar(value=str(Path.home() / "MitoData"))
         self.status, self.data_status = tk.StringVar(value=self.t("idle")), tk.StringVar(value="")
         self.rec, self.raw, self.busy, self.toggle_req, self.msg, self.f9 = None, None, False, False, None, False
@@ -1437,6 +1575,12 @@ class App:
         line(t("sens"), ttk.Entry(f, textvariable=self.sens, width=10))
         line(t("quality"), ttk.Combobox(f, state="readonly", width=30, values=list(X264_PROFILES),
                                         textvariable=self.quality))
+        ff = ttk.Frame(f)
+        self.fps_box = ttk.Combobox(ff, state="readonly", width=6, values=[str(x) for x in FPS_CHOICES],
+                                    textvariable=self.fps_var)
+        self.fps_box.pack(side="left")
+        ttk.Label(ff, text=t("fps_hint"), foreground="#666").pack(side="left", padx=8)
+        line(t("fps"), ff)
         line(t("save_to"), ttk.Entry(f, textvariable=self.out, width=58),
              ttk.Button(f, text=t("browse"), command=self.browse))
         self.btn = ttk.Button(f, text=t("stop") if self.rec else t("start"), command=self.toggle)
@@ -1535,8 +1679,9 @@ class App:
         game, root = safe_name(self.game.get()), Path(self.out.get())
         d = root / f"{game}_{next_index(root, game)}"
         try:
-            self.rec = Recorder(d, FPS, lambda: window_rect(hwnd), target=("window", hwnd), hwnd=hwnd,
-                                pid=window_pid(hwnd), x264=X264_PROFILES[self.quality.get()],
+            self.rec = Recorder(d, int(self.fps_var.get()), lambda: window_rect(hwnd), target=("window", hwnd),
+                                hwnd=hwnd, zero_copy=True, pid=window_pid(hwnd),
+                                x264=X264_PROFILES[self.quality.get()],
                                 game=game, title=title,
                                 user={"mouse_dpi": self.dpi.get().strip(),
                                       "game_sensitivity": self.sens.get().strip()}).start()
@@ -1549,7 +1694,7 @@ class App:
     def _finish(self, rec):
         try:
             meta = rec.stop()
-            z = zip_session(rec.out, free_zip_name(rec.out.parent, rec.game, duration_tag(meta["duration_s"])))
+            z = rec.package(free_zip_name(rec.out.parent, rec.game, duration_tag(meta["duration_s"])))
             self.msg = (self.t("saved", name=z.name, minutes=meta["duration_s"] / 60, fps=meta["fps_actual"],
                                gb=z.stat().st_size / 1e9) + " " +
                         (self.t("warnings", w="; ".join(meta["warnings"])) if meta["warnings"] else self.t("quality_ok")) +
@@ -1634,6 +1779,7 @@ class App:
         if self.msg:
             self.status.set(self.msg)
             self.msg = None
+        self.fps_box.config(state="disabled" if self.rec or self.busy else "readonly")
         try:
             self.show_data(*self.data_q.get_nowait())
         except queue.Empty:
@@ -1725,7 +1871,7 @@ def selftest(a):
     d = root / f"{game}_{next_index(root, game)}"
     log(f"platform={sys.platform} windows={len(list_windows())}")
     idx, mon = list_monitors()[0][1]
-    rec = Recorder(d, FPS, lambda: mon, target=("monitor", idx), game=game, title=game).start()
+    rec = Recorder(d, a.fps, lambda: mon, target=("monitor", idx), game=game, title=game, zero_copy=True).start()
     raw = RawInput(rec.on_raw).start() if IS_WIN else None
     end = time.time() + 10
     while rec.frames == 0 and time.time() < end:  # capture backend startup is slow on CI
@@ -1738,11 +1884,21 @@ def selftest(a):
         raw.stop()
     log(f"recorded {json.dumps(meta)}")
     assert meta["frames"] > 0 and not meta["error"], meta
+    assert meta["fps_requested"] == a.fps and abs(meta["frames"] - round(meta["duration_s"] * a.fps)) <= 2, meta  # constant fps
     assert meta["video_size"][1] <= MAX_H, meta["video_size"]
     import av
-    with av.open(str(d / "video.mp4")) as c:  # the fragmented mp4 must decode completely
+    z = rec.package(d.name)  # zero-copy zip: the video is read back out of the finished zip
+    with zipfile.ZipFile(z) as zf:
+        assert zf.testzip() is None
+        zf.extract(f"{d.name}/video.mp4", root / "x")
+    with av.open(str(root / "x" / d.name / "video.mp4")) as c:  # the fragmented mp4 must decode completely
         n = sum(1 for _ in c.decode(video=0))
     assert abs(n - meta["frames"]) <= 1, (n, meta["frames"])
+    d.mkdir(exist_ok=True)  # frames.csv & co. were packed into the zip; unpack them for the checks below
+    with zipfile.ZipFile(z) as zf:
+        for nm in zf.namelist():
+            if not nm.endswith("video.mp4"):
+                (d / Path(nm).name).write_bytes(zf.read(nm))
     rows = list(csv.DictReader(open(d / "frames.csv")))
     assert len(rows) == meta["frames"] and set(rows[0]) == {"frame", "t", "src_t", "fresh"}, rows[:1]
     assert meta["quality"]["fresh_frame_share"] > 0, meta["quality"]
@@ -1758,7 +1914,6 @@ def selftest(a):
         assert any(e["kind"] == "key_down" and e["key"] == "x" for e in inputs), "raw key missing"
     else:
         log(f"WARNING: SendInput accepted {sent}/3 events (no interactive desktop?); input path untested")
-    z = zip_session(d)
     names = zipfile.ZipFile(z).namelist()
     need = [f"{d.name}/{n}" for n in ("video.mp4", "frames.csv", "inputs.jsonl", "meta.json", "profile.json")]
     assert all(n in names for n in need), names
@@ -1812,6 +1967,7 @@ def main():
     ap.add_argument("--update-now", action="store_true")
     ap.add_argument("--as-version", default=VERSION)
     ap.add_argument("--seconds", type=float, default=3)
+    ap.add_argument("--fps", type=int, default=FPS_DEFAULT, choices=FPS_CHOICES)
     a = ap.parse_args()
     cleanup_old_exe()
     try:
@@ -1824,7 +1980,17 @@ def main():
         elif a.selftest:
             selftest(a)
         else:
-            App().root.mainloop()
+            app = App()
+            threading.Thread(target=recover_parts, args=(app.out.get(),), daemon=True).start()
+            app.root.mainloop()
+    except ModuleNotFoundError as e:
+        if getattr(sys, "frozen", False) and not os.environ.get("MITO_FRESH"):
+            # started by an older version's updater, which handed over its own (soon deleted) temp dir: run again clean
+            log(f"bundle of the previous process is gone ({e}); restarting clean")
+            subprocess.Popen([sys.executable, *sys.argv[1:]], env=fresh_env(MITO_FRESH="1"))
+            raise SystemExit(0)
+        log(f"FAILED: {e!r}")
+        raise SystemExit(1)
     except Exception as e:
         log(f"FAILED: {e!r}")
         raise SystemExit(1)
