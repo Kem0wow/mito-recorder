@@ -319,3 +319,26 @@ def test_audio_thread_stops_even_when_the_source_never_goes_quiet(tmp_path):
     finally:
         R.PcLoopback = orig
     assert rec.audio_error is None and rec.audio_stats[0] >= 0.9   # ~1 s of audio, file closed properly
+
+
+def test_settings_roundtrip_and_bad_files(tmp_path):
+    from recorder import X264_PROFILES, load_settings, save_settings
+    p = tmp_path / "s.json"
+    good = {"lang": "tr", "fps": 36, "quality": "Light (less CPU, bigger files)",
+            "out": "D:/kayit", "dpi": "800", "sens": "0.6"}
+    save_settings(good, p)
+    assert load_settings(p) == good
+    p.write_text('{"lang": "xx", "fps": 99, "quality": "?", "out": "", "dpi": "1", "extra": 1}')
+    assert load_settings(p) == {"dpi": "1"}            # every bad value is dropped, unknown keys ignored
+    p.write_text("not json")
+    assert load_settings(p) == {}
+    assert load_settings(tmp_path / "missing.json") == {}
+    assert "Light (less CPU, bigger files)" in X264_PROFILES
+
+
+def test_ui_theme_is_ghost_white_and_forest_green():
+    import ui_theme
+    pal = ui_theme.PAL
+    assert pal["bg"].lower() == "#f8f8ff" and pal["accent"].lower() == "#228b22"   # ghost white, forest green
+    assert all(len(v) == 7 and v.startswith("#") for v in pal.values())
+    assert ui_theme.mix("#000000", "#ffffff", 0.5) == "#808080" and ui_theme.mix("#228b22", "#f8f8ff", 0) == "#228b22"

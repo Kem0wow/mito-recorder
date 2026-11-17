@@ -35,6 +35,8 @@ import types
 import webbrowser
 import zipfile
 import zlib
+
+import ui_theme
 from fractions import Fraction
 from pathlib import Path
 
@@ -51,7 +53,7 @@ except ImportError:
     DRIVE_API_KEY = ""
 STR = {
 "en": {
- "tab_record": "Record", "tab_instr": "Instructions", "tab_data": "Data", "tab_update": "Update",
+ "tab_record": "Record", "tab_instr": "Help", "tab_data": "Data", "tab_update": "Update",
  "tab_update_new": "Update (new!)", "this_version": "This version: v{v}", "check_update": "Check for updates",
  "update_now": "Update now", "upd_checking": "Checking GitHub...", "upd_latest": "You have the latest version.",
  "upd_new": "New version v{v} is available. Press Update now: the app downloads it, checks it and restarts.",
@@ -60,6 +62,15 @@ STR = {
  "upd_err": "Update check failed: {err}", "upd_notes": "What's new:",
  "game_window": "Game window", "refresh": "Refresh", "game_name": "Game name", "fps": "FPS",
  "fps_hint": "36 needs a stronger PC; if 'Low FPS' shows, pick 24 or 30",
+ "sec_game": "Game", "sec_settings": "Recording settings", "q_good": "Good", "q_light": "Light",
+ "q_hint": "Good: finest detail, heavier on the CPU. Light: easier on weak PCs, bigger files.",
+ "mouse_opt": "Mouse (optional)", "state_ready": "Ready", "state_rec": "Recording", "state_saving": "Saving",
+ "chip_fps": "{n}/{target} fps", "chip_drop": "{n} dropped", "chip_focus": "Focused", "chip_nofocus": "Not focused",
+ "chip_sound": "Sound", "chip_nosound": "No sound", "chip_input": "Input", "chip_noinput": "No input",
+ "idle_fps": "FPS", "idle_drop": "Dropped", "idle_focus": "Focus", "idle_sound": "Sound", "idle_input": "Input",
+ "stat_rec": "Recordings", "stat_games": "Games", "stat_total": "Total time", "dataset": "Dataset",
+ "seg_howto": "How to", "seg_tips": "Tips", "seg_fixes": "Fixes", "dpi_s": "DPI", "sens_s": "Sens.",
+ "whats_new": "What's new",
  "dpi": "Mouse DPI (optional)", "sens": "Game sensitivity (optional)", "quality": "Video quality",
  "save_to": "Save to", "browse": "Browse", "start": "Start (F9)", "stop": "Stop (F9)", "saving": "Saving...",
  "idle": "Pick the game window, then press Start (or F9 in game).",
@@ -109,7 +120,7 @@ STR = {
           "no sound, low fps), fix it and record again.")
 },
 "tr": {
- "tab_record": "Kayıt", "tab_instr": "Talimatlar", "tab_data": "Veri", "tab_update": "Güncelleme",
+ "tab_record": "Kayıt", "tab_instr": "Yardım", "tab_data": "Veri", "tab_update": "Güncelleme",
  "tab_update_new": "Güncelleme (yeni!)", "this_version": "Bu sürüm: v{v}", "check_update": "Güncellemeleri kontrol et",
  "update_now": "Şimdi güncelle", "upd_checking": "GitHub kontrol ediliyor...", "upd_latest": "En son sürümü kullanıyorsun.",
  "upd_new": "Yeni sürüm v{v} hazır. Şimdi güncelle'ye bas: uygulama indirir, kontrol eder ve yeniden açılır.",
@@ -118,6 +129,15 @@ STR = {
  "upd_err": "Güncelleme kontrolü başarısız: {err}", "upd_notes": "Yenilikler:",
  "game_window": "Oyun penceresi", "refresh": "Yenile", "game_name": "Oyun adı", "fps": "FPS",
  "fps_hint": "36 daha güçlü PC ister; 'Düşük FPS' çıkarsa 24 veya 30 seç",
+ "sec_game": "Oyun", "sec_settings": "Kayıt ayarları", "q_good": "İyi", "q_light": "Hafif",
+ "q_hint": "İyi: en ince detay, işlemciyi daha çok yorar. Hafif: zayıf PC'de rahat, dosyalar daha büyük.",
+ "mouse_opt": "Fare (isteğe bağlı)", "state_ready": "Hazır", "state_rec": "Kayıtta", "state_saving": "Kaydediliyor",
+ "chip_fps": "{n}/{target} fps", "chip_drop": "{n} kare kaybı", "chip_focus": "Odakta", "chip_nofocus": "Odakta değil",
+ "chip_sound": "Ses var", "chip_nosound": "Ses yok", "chip_input": "Girdi var", "chip_noinput": "Girdi yok",
+ "idle_fps": "FPS", "idle_drop": "Kare kaybı", "idle_focus": "Odak", "idle_sound": "Ses", "idle_input": "Girdi",
+ "stat_rec": "Kayıt", "stat_games": "Oyun", "stat_total": "Toplam süre", "dataset": "Veri seti",
+ "seg_howto": "Nasıl", "seg_tips": "İpuçları", "seg_fixes": "Çözümler", "dpi_s": "DPI", "sens_s": "Hassas.",
+ "whats_new": "Yenilikler",
  "dpi": "Mouse DPI (isteğe bağlı)", "sens": "Oyun hassasiyeti (isteğe bağlı)", "quality": "Video kalitesi",
  "save_to": "Kayıt klasörü", "browse": "Gözat", "start": "Başlat (F9)", "stop": "Durdur (F9)",
  "saving": "Kaydediliyor...",
@@ -180,6 +200,7 @@ IS_WIN = sys.platform == "win32"
 FPS_CHOICES = (24, 30, 36)  # Record-tab combobox; the pipeline samples by session time t, never by frame index
 FPS_DEFAULT = 30
 FPS = FPS_DEFAULT  # selftest / headless default
+WIN_SIZE = 480  # the window is a fixed 480 x 480 (scaled with the display), no resizing and no scrolling
 MIN_FREE = 3e9   # refuse to start with less free disk than this
 LOW_FREE = 5e8   # stop (and save) a running session below this
 MAX_H = 720
@@ -212,6 +233,31 @@ def resource(name):  # next to recorder.py, or unpacked inside the exe (PyInstal
 
 def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+SETTINGS_FILE = Path.home() / "MitoRecorder.json"
+SETTINGS_KEYS = ("lang", "fps", "quality", "out", "dpi", "sens")
+
+
+def load_settings(path=None):
+    """Remembered choices from the last run, each checked: a bad or missing file just gives the defaults."""
+    try:
+        d = json.loads(Path(path or SETTINGS_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    ok = {"lang": lambda v: v in STR,
+          "fps": lambda v: v in FPS_CHOICES, "quality": lambda v: v in X264_PROFILES,
+          "out": lambda v: isinstance(v, str) and 0 < len(v) < 400,
+          "dpi": lambda v: isinstance(v, str) and len(v) < 12, "sens": lambda v: isinstance(v, str) and len(v) < 12}
+    return {k: d[k] for k in SETTINGS_KEYS if k in d and ok[k](d[k])} if isinstance(d, dict) else {}
+
+
+def save_settings(d, path=None):
+    try:
+        Path(path or SETTINGS_FILE).write_text(json.dumps({k: d[k] for k in SETTINGS_KEYS if k in d}, indent=1),
+                                               encoding="utf-8")
+    except OSError:
+        pass
 
 
 def set_priority(level):
@@ -1469,11 +1515,11 @@ class App:
     def __init__(self):
         import tkinter as tk
         from tkinter import ttk
-        self.tk, self.ttk, self.lang = tk, ttk, "en"
+        saved = load_settings()
+        self.tk, self.ttk, self.lang = tk, ttk, saved.get("lang", "en")
+        self.pal = ui_theme.PAL
         self.root = root = tk.Tk()
         root.title("Mito Recorder")
-        ttk.Style(root).theme_use("vista" if IS_WIN else "clam")  # native look on Windows
-        root.resizable(False, False)
         try:  # window and taskbar icon
             if IS_WIN:
                 root.iconbitmap(str(resource("icon.ico")))
@@ -1482,10 +1528,12 @@ class App:
         except Exception as e:
             log(f"icon: {e}")
         self.game = tk.StringVar()
-        self.dpi, self.sens = tk.StringVar(), tk.StringVar()
-        self.quality = tk.StringVar(value=X264_DEFAULT)
-        self.fps_var = tk.StringVar(value=str(FPS_DEFAULT))
-        self.out = tk.StringVar(value=str(Path.home() / "MitoData"))
+        self.dpi, self.sens = tk.StringVar(value=saved.get("dpi", "")), tk.StringVar(value=saved.get("sens", ""))
+        self.quality = tk.StringVar(value=saved.get("quality", X264_DEFAULT))
+        self.fps_var = tk.StringVar(value=str(saved.get("fps", FPS_DEFAULT)))
+        self.lang_var = tk.StringVar(value=self.lang)
+        self.out = tk.StringVar(value=saved.get("out", str(Path.home() / "MitoData")))
+        self.live, self._last = None, {}  # live numbers of the last monitor() / what the status panel shows now
         self.status, self.data_status = tk.StringVar(value=self.t("idle")), tk.StringVar(value="")
         self.rec, self.raw, self.busy, self.toggle_req, self.msg, self.f9 = None, None, False, False, None, False
         self.issues, self.mon, self.unf_since, self.last_mon, self.blink_n = [], [], None, 0.0, 0
@@ -1493,6 +1541,11 @@ class App:
         self.data_q, self.last_data, self.targets = queue.Queue(), None, []
         self.upd_q, self.upd_info, self.upd_status = queue.Queue(), None, tk.StringVar(value="")
         self.build()
+        sc = ui_theme.scale(root)
+        ax, ay, aw, ah = ui_theme.work_area(root)  # screen minus the taskbar
+        side = round(WIN_SIZE * sc)
+        root.geometry(f"{side}x{side}+{ax + (aw - side) // 2}+{ay + max(0, (ah - side - round(48 * sc)) // 2)}")
+        root.resizable(False, False)  # fixed size: it neither grows nor shrinks
         self.check_update()
         self.refresh()
         if IS_WIN:
@@ -1506,113 +1559,236 @@ class App:
     def t(self, key, **kw):
         return tr(key, self.lang, **kw)
 
+    def settings(self):
+        return {"lang": self.lang, "fps": int(self.fps_var.get() or FPS_DEFAULT),
+                "quality": self.quality.get(), "out": self.out.get(), "dpi": self.dpi.get().strip(),
+                "sens": self.sens.get().strip()}
+
     def set_lang(self, code):
         if code == self.lang:
             return
         self.lang = code
+        self.lang_var.set(code)
         self.target_text = self.target.get()
         if not self.rec:
             self.status.set(self.t("idle"))
+        save_settings(self.settings())
         self.build()
 
     def build(self):  # (re)creates every widget in the current language; state lives in self.*
-        tk, ttk, root, t = self.tk, self.ttk, self.root, self.t
+        tk, ttk, root, t, ui, pal = self.tk, self.ttk, self.root, self.t, ui_theme, self.pal
         self.target_text = getattr(self, "target_text", "")
         for w in root.winfo_children():
             w.destroy()
-        bar = ttk.Frame(root)
-        bar.pack(anchor="e", padx=10, pady=(6, 0))
+        ui.apply(root, pal)
+        sc = ui.scale(root)
+        px = self._px = lambda n: round(n * sc)  # noqa: E731
+        self._last = {}
+        side = px(WIN_SIZE)
+        _, cell_w = ui.hive(root, pal, side, side, px(22))  # honeycomb strip: half of it is outside the window
+        right = round(cell_w) + px(8)  # keep every widget clear of the strip
+        wrap = side - px(20) - right - px(6)
+
+        # header: logo, name, language
+        head = tk.Frame(root, bg=pal["bg"])
+        head.pack(fill="x", padx=(px(20), right), pady=(px(12), px(2)))
+        if getattr(self, "_icon", None):
+            try:
+                self._logo = self._icon.subsample(max(1, round(256 / (26 * sc))))
+                tk.Label(head, image=self._logo, bg=pal["bg"]).pack(side="left", padx=(0, px(8)))
+            except Exception:
+                pass
+        ui.label(head, pal, "Mito Recorder", "title").pack(side="left")
+        ui.label(head, pal, f"v{VERSION}", "small").pack(side="left", padx=(px(8), 0), pady=(px(4), 0))
+        seg = tk.Frame(head, bg=pal["raised"])
+        seg.pack(side="right")
         for code in ("en", "tr"):
-            b = ttk.Button(bar, text=code.upper(), width=4, command=lambda c=code: self.set_lang(c))
-            b.pack(side="left", padx=2)
-            if code == self.lang:
-                b.state(["disabled"])
-        nb = ttk.Notebook(root)
-        nb.pack(fill="both", expand=True)
-        f, ins, dat = ttk.Frame(nb, padding=16), ttk.Frame(nb, padding=16), ttk.Frame(nb, padding=16)
-        upd = ttk.Frame(nb, padding=16)
-        nb.add(f, text=t("tab_record"))
-        nb.add(ins, text=t("tab_instr"))
-        nb.add(dat, text=t("tab_data"))
-        nb.add(upd, text=t("tab_update"))
-        self.nb, self.ins, self.upd_tab = nb, ins, upd
+            ttk.Radiobutton(seg, text=code.upper(), style="Seg.Toolbutton", variable=self.lang_var, value=code,
+                            command=lambda c=code: self.set_lang(c)).pack(side="left")
 
-        # Update tab
-        ttk.Label(upd, text=t("this_version", v=VERSION)).pack(anchor="w")
-        btns = ttk.Frame(upd)
-        btns.pack(anchor="w", pady=8)
-        ttk.Button(btns, text=t("check_update"), command=self.check_update).pack(side="left")
-        self.upd_btn = ttk.Button(btns, text=t("update_now"), command=self.do_update, state="disabled")
-        self.upd_btn.pack(side="left", padx=6)
-        ttk.Label(upd, textvariable=self.upd_status, wraplength=560, justify="left").pack(anchor="w")
-        self.upd_notes = ttk.Label(upd, text="", wraplength=560, justify="left")
-        self.upd_notes.pack(anchor="w", pady=(10, 0))
-        if self.upd_info:
-            self.show_update(("ok", self.upd_info))
+        tabs = ui.Tabs(root, pal)
+        tabs.root.pack(fill="both", expand=True, padx=(0, right))
+        rec, hlp, dat, upd = (tk.Frame(tabs.body, bg=pal["bg"]) for _ in range(4))
+        tabs.add(rec, t("tab_record"))
+        tabs.add(hlp, t("tab_instr"))
+        tabs.add(dat, t("tab_data"))
+        tabs.add(upd, t("tab_update"))
+        self.nb, self.ins, self.upd_tab = tabs, hlp, upd
 
-        # Data tab
-        ttk.Button(dat, text=t("update_data"), command=self.update_data).pack(anchor="w")
-        ttk.Label(dat, textvariable=self.data_status, wraplength=560, justify="left").pack(anchor="w", pady=(8, 10))
-        self.tree = ttk.Treeview(dat, columns=("game", "total", "runs"), show="headings", height=14)
-        for col, key, w in (("game", "col_game", 260), ("total", "col_total", 200), ("runs", "col_runs", 90)):
-            self.tree.heading(col, text=t(key))
-            self.tree.column(col, width=w, anchor="w" if col == "game" else "center")
-        self.tree.pack(fill="both", expand=True)
-        if self.last_data:
-            self.show_data(*self.last_data)
+        # ---------------- Record tab: four rows, the button, the live line
+        col = tk.Frame(rec, bg=pal["bg"])
+        col.pack(fill="both", expand=True, padx=(px(20), 0), pady=(px(8), 0))
+        g = tk.Frame(col, bg=pal["bg"])
+        g.pack(fill="x")
+        g.columnconfigure(0, minsize=px(104))
+        g.columnconfigure(1, weight=1)
 
-        # Record tab
-        row = itertools.count()
+        def row(n, text):
+            ui.label(g, pal, text, "small").grid(row=n, column=0, sticky="w", pady=px(3))
+            f = tk.Frame(g, bg=pal["bg"])
+            f.grid(row=n, column=1, sticky="we", pady=px(3))
+            return f
 
-        def line(label, *widgets):
-            r = next(row)
-            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=3)
-            for c, w in enumerate(widgets, 1):
-                w.grid(row=r, column=c, sticky="we", padx=3)
-
-        self.target = ttk.Combobox(f, state="readonly", width=55, values=[lbl for lbl, _, _ in self.targets])
+        f = row(0, t("game_window"))
+        ttk.Button(f, text="↻", width=3, command=self.refresh).pack(side="right", padx=(px(6), 0))
+        self.target = ttk.Combobox(f, state="readonly", values=[lbl for lbl, _, _ in self.targets])
         self.target.bind("<<ComboboxSelected>>", lambda _e: self._pick())
         if self.target_text:
             self.target.set(self.target_text)
-        line(t("game_window"), self.target, ttk.Button(f, text=t("refresh"), command=self.refresh))
-        line(t("game_name"), ttk.Entry(f, textvariable=self.game, width=58))
-        line(t("dpi"), ttk.Entry(f, textvariable=self.dpi, width=10))
-        line(t("sens"), ttk.Entry(f, textvariable=self.sens, width=10))
-        line(t("quality"), ttk.Combobox(f, state="readonly", width=30, values=list(X264_PROFILES),
-                                        textvariable=self.quality))
-        ff = ttk.Frame(f)
-        self.fps_box = ttk.Combobox(ff, state="readonly", width=6, values=[str(x) for x in FPS_CHOICES],
+        self.target.pack(side="left", fill="x", expand=True)
+        ttk.Entry(row(1, t("game_name")), textvariable=self.game).pack(fill="x")
+        f = row(2, t("quality"))
+        for name, key in (("q_good", "Good quality (heavy CPU)"), ("q_light", "Light (less CPU, bigger files)")):
+            ttk.Radiobutton(f, text=t(name), style="Seg.Toolbutton", variable=self.quality,
+                            value=key).pack(side="left")
+        self.fps_box = ttk.Combobox(f, state="readonly", width=4, values=[str(x) for x in FPS_CHOICES],
                                     textvariable=self.fps_var)
-        self.fps_box.pack(side="left")
-        ttk.Label(ff, text=t("fps_hint"), foreground="#666").pack(side="left", padx=8)
-        line(t("fps"), ff)
-        line(t("save_to"), ttk.Entry(f, textvariable=self.out, width=58),
-             ttk.Button(f, text=t("browse"), command=self.browse))
-        self.btn = ttk.Button(f, text=t("stop") if self.rec else t("start"), command=self.toggle)
-        self.btn.grid(row=next(row), column=0, columnspan=3, sticky="we", pady=8)
-        ttk.Label(f, textvariable=self.status, wraplength=520).grid(row=next(row), column=0, columnspan=3, sticky="w")
-        self.banner = tk.Label(f, justify="left", wraplength=540, cursor="hand2")
-        self.banner.grid(row=next(row), column=0, columnspan=3, sticky="we", pady=(6, 0))
-        self.banner.grid_remove()
-        self.bg0 = self.banner.cget("bg")
-        self.banner.bind("<Button-1>", lambda _e: self.issues and self.show_fix(self.issues[0][1]))
-        bf = ttk.Frame(f)
-        bf.grid(row=next(row), column=0, columnspan=3, sticky="we", pady=(0, 6))
-        ttk.Button(bf, text=t("upload"), command=lambda: webbrowser.open(UPLOAD_URL)
-                   ).pack(side="left", expand=True, fill="x", padx=(0, 3))
-        ttk.Button(bf, text=t("open_folder"), command=self.open_folder
-                   ).pack(side="left", expand=True, fill="x", padx=(3, 0))
-        ttk.Label(f, text=t("consent"), wraplength=520, justify="left", foreground="#666").grid(
-            row=next(row), column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.fps_box.pack(side="right")
+        ui.label(f, pal, t("fps"), "small").pack(side="right", padx=(0, px(6)))
+        f = row(3, t("save_to"))
+        ttk.Button(f, text=t("browse"), command=self.browse).pack(side="right", padx=(px(6), 0))
+        ttk.Entry(f, textvariable=self.out).pack(side="left", fill="x", expand=True)
+        f = row(4, t("mouse_opt"))
+        for name, var in ((t("dpi_s"), self.dpi), (t("sens_s"), self.sens)):
+            ui.label(f, pal, name, "small").pack(side="left", padx=(0, px(5)))
+            ttk.Entry(f, textvariable=var, width=7).pack(side="left", padx=(0, px(14)))
 
-        # Instructions tab
-        for txt in (t("howto"), t("tips")):
-            ttk.Label(ins, text=txt, wraplength=560, justify="left").pack(anchor="w", pady=(0, 14))
-        ttk.Label(ins, text=t("fix_header")).pack(anchor="w")
-        self.fix_labels = {}
-        for key in FIX_KEYS:
-            self.fix_labels[key] = tk.Label(ins, text=t("fix_" + key), wraplength=560, justify="left")
-            self.fix_labels[key].pack(anchor="w", pady=(4, 0))
+        def fps_note(*_):  # 36 fps needs a stronger PC: say so while idle
+            if not (self.rec or self.busy):
+                self.status.set(t("fps_hint") if self.fps_var.get() == "36" else t("idle"))
+
+        if getattr(self, "_fps_trace", None):
+            self.fps_var.trace_remove("write", self._fps_trace)
+        self._fps_trace = self.fps_var.trace_add("write", fps_note)
+
+        self.btn = ttk.Button(col, text=t("stop") if self.rec else t("start"), command=self.toggle,
+                              style="Big.Danger.TButton" if self.rec else "Big.Accent.TButton")
+        self.btn.pack(fill="x", pady=(px(10), px(6)))
+
+        top = tk.Frame(col, bg=pal["bg"])
+        top.pack(fill="x")
+        self.dot = tk.Label(top, text="●", font=ui.font(13), fg=pal["muted"], bg=pal["bg"])
+        self.dot.pack(side="left")
+        self.state_lbl = ui.label(top, pal, t("state_ready"), "h")
+        self.state_lbl.pack(side="left", padx=(px(6), 0))
+        self.timer = ui.label(top, pal, "00:00", "num")
+        self.timer.pack(side="right")
+        slot = tk.Frame(col, bg=pal["bg"], height=px(42))  # one place for the message OR the warning bar
+        slot.pack(fill="x", pady=(px(2), px(4)))
+        slot.pack_propagate(False)
+        self.status_lbl = tk.Label(slot, textvariable=self.status, font=ui.font(9), fg=pal["muted"], bg=pal["bg"],
+                                   wraplength=wrap, justify="left", anchor="nw")
+        self.status_lbl.pack(fill="both", expand=True)
+        self.banner = tk.Label(slot, justify="left", wraplength=wrap - px(24), cursor="hand2", anchor="w",
+                               font=ui.font(9, True), padx=px(10), pady=px(6))
+        self.banner.bind("<Button-1>", lambda _e: self.issues and self.show_fix(self.issues[0][1]))
+        self._banner_on = False
+        chips = tk.Frame(col, bg=pal["bg"])
+        chips.pack(fill="x")
+        self.chips = {k: ui.chip(chips, pal, t("idle_" + k)) for k in ("fps", "drop", "focus", "sound", "input")}
+        for ch in self.chips.values():
+            ch.pack(side="left", padx=(0, px(4)))
+
+        # ---------------- Help tab: three short views (how to / tips / fixes), nothing scrolls
+        hv = tk.Frame(hlp, bg=pal["bg"])
+        hv.pack(fill="both", expand=True, padx=(px(20), 0), pady=(px(10), 0))
+        self.help_var = tk.StringVar(value=getattr(self, "_help_view", "howto"))
+        self.fix_var = tk.StringVar(value=getattr(self, "_fix_key", FIX_KEYS[0]))
+        segf = tk.Frame(hv, bg=pal["raised"])
+        segf.pack(anchor="w")
+        hbody = tk.Frame(hv, bg=pal["bg"])
+        hbody.pack(fill="both", expand=True, pady=(px(10), 0))
+        lines_wrap = wrap - px(34)
+
+        def show_help(*_):
+            for w in hbody.winfo_children():
+                w.destroy()
+            view = self.help_var.get()
+            self._help_view = view
+            if view == "fixes":
+                grid = tk.Frame(hbody, bg=pal["bg"])
+                grid.pack(fill="x")
+                for n, key in enumerate(FIX_KEYS):
+                    on = key == self.fix_var.get()
+                    b = tk.Label(grid, text=t("short_" + key), font=ui.font(9, True), cursor="hand2",
+                                 bg=pal["accent"] if on else pal["raised"], fg=pal["accent_fg"] if on else pal["muted"],
+                                 padx=px(8), pady=px(4))
+                    b.grid(row=n // 3, column=n % 3, sticky="we", padx=(0, px(4)), pady=(0, px(4)))
+                    b.bind("<Button-1>", lambda _e, k=key: self.show_fix(k))
+                for c_ in range(3):
+                    grid.columnconfigure(c_, weight=1, uniform="fx")
+                key = self.fix_var.get()
+                box = tk.Frame(hbody, bg=pal["raised"])
+                box.pack(fill="x", pady=(px(8), 0))
+                tk.Frame(box, bg=pal["danger"] if key in ("black", "fps", "disk") else pal["warn"],
+                         width=px(4)).pack(side="left", fill="y")
+                tk.Label(box, text=t("fix_" + key), font=ui.font(10), fg=pal["text"], bg=pal["raised"],
+                         wraplength=wrap - px(40), justify="left", anchor="w", padx=px(12), pady=px(10)
+                         ).pack(side="left", fill="x", expand=True)
+                return
+            head_line, *lines = [x for x in t(view).split("\n") if x.strip()]
+            for ln in lines:
+                m = re.match(r"^(\d+)\.\s+(.*)$", ln) if view == "howto" else re.match(r"^-\s+(.*)$", ln)
+                r = tk.Frame(hbody, bg=pal["bg"])
+                r.pack(fill="x", pady=px(2))
+                if view == "howto" and m:
+                    tk.Label(r, text=m.group(1), font=ui.font(8, True), fg=pal["accent_fg"], bg=pal["accent"],
+                             width=2).pack(side="left", anchor="n", padx=(0, px(8)))
+                elif m:
+                    tk.Label(r, text="•", font=ui.font(10, True), fg=pal["accent"], bg=pal["bg"]
+                             ).pack(side="left", anchor="n", padx=(0, px(6)))
+                ui.label(r, pal, m.group(m.lastindex) if m else ln, "body" if view == "howto" else "small",
+                         wraplength=lines_wrap, fg=pal["text"]).pack(side="left")
+            if view == "howto":
+                bf = tk.Frame(hbody, bg=pal["bg"])
+                bf.pack(fill="x", pady=(px(10), 0))
+                ttk.Button(bf, text=t("upload"), command=lambda: webbrowser.open(UPLOAD_URL)
+                           ).pack(side="left", expand=True, fill="x", padx=(0, px(3)))
+                ttk.Button(bf, text=t("open_folder"), command=self.open_folder
+                           ).pack(side="left", expand=True, fill="x", padx=(px(3), 0))
+                ui.label(hbody, pal, t("consent"), "small", wraplength=wrap).pack(fill="x", pady=(px(8), 0))
+
+        self._show_help = show_help
+        for name, view in (("seg_howto", "howto"), ("seg_tips", "tips"), ("seg_fixes", "fixes")):
+            ttk.Radiobutton(segf, text=t(name), style="Seg.Toolbutton", variable=self.help_var, value=view,
+                            command=show_help).pack(side="left")
+        show_help()
+
+        # ---------------- Data tab
+        dd = tk.Frame(dat, bg=pal["bg"])
+        dd.pack(fill="both", expand=True, padx=(px(20), 0), pady=(px(10), 0))
+        top = tk.Frame(dd, bg=pal["bg"])
+        top.pack(fill="x")
+        ttk.Button(top, text=t("update_data"), command=self.update_data).pack(side="right")
+        tk.Label(top, textvariable=self.data_status, font=ui.font(10, True), fg=pal["text"], bg=pal["bg"],
+                 wraplength=wrap - px(120), justify="left", anchor="w").pack(side="left", fill="x", expand=True)
+        self.tree = ttk.Treeview(dd, columns=("game", "total", "runs"), show="headings", height=9)
+        for col_, key, w in (("game", "col_game", 170), ("total", "col_total", 120), ("runs", "col_runs", 90)):
+            self.tree.heading(col_, text=t(key), anchor="w" if col_ == "game" else "center")
+            self.tree.column(col_, width=px(w), anchor="w" if col_ == "game" else "center")
+        self.tree.tag_configure("odd", background=pal["raised"])
+        self.tree.pack(fill="both", expand=True, pady=(px(10), px(6)))
+        if self.last_data:
+            self.show_data(*self.last_data)
+
+        # ---------------- Update tab
+        up = tk.Frame(upd, bg=pal["bg"])
+        up.pack(fill="both", expand=True, padx=(px(20), 0), pady=(px(12), 0))
+        ui.label(up, pal, t("this_version", v=VERSION), "h").pack(anchor="w")
+        tk.Label(up, textvariable=self.upd_status, font=ui.font(10), fg=pal["muted"], bg=pal["bg"], wraplength=wrap,
+                 justify="left", anchor="w").pack(fill="x", pady=(px(4), px(10)))
+        btns = tk.Frame(up, bg=pal["bg"])
+        btns.pack(anchor="w")
+        ttk.Button(btns, text=t("check_update"), command=self.check_update).pack(side="left")
+        self.upd_btn = ttk.Button(btns, text=t("update_now"), command=self.do_update, state="disabled",
+                                  style="Accent.TButton")
+        self.upd_btn.pack(side="left", padx=px(8))
+        self.upd_notes = tk.Label(up, text="", font=ui.font(9), fg=pal["text"], bg=pal["bg"], wraplength=wrap,
+                                  justify="left", anchor="nw")
+        self.upd_notes.pack(fill="x", pady=(px(14), 0))
+        if self.upd_info:
+            self.show_update(("ok", self.upd_info))
+        self.render_live()
         self.show_banner()
 
     def open_folder(self):
@@ -1661,9 +1837,12 @@ class App:
             self.data_status.set(val)
             return
         rows, _ = val  # old-style names (no duration) are left out
-        for game, sec, runs in rows:
-            self.tree.insert("", "end", values=(game, format_hms(sec, self.lang), runs))
-        self.data_status.set(self.t("data_summary", n=sum(r[2] for r in rows), g=len(rows)) if rows else self.t("data_none"))
+        for n, (game, sec, runs) in enumerate(rows):
+            self.tree.insert("", "end", values=(game, format_hms(sec, self.lang), runs),
+                             tags=("odd",) if n % 2 else ())
+        self.data_status.set(
+            self.t("data_summary", n=sum(r[2] for r in rows), g=len(rows)) + "  " + format_hms(sum(r[1] for r in rows), self.lang)
+            if rows else self.t("data_none"))
 
     def toggle(self):
         from tkinter import messagebox
@@ -1672,7 +1851,7 @@ class App:
         if self.rec:
             rec, self.rec = self.rec, None
             self.busy = True
-            self.btn.config(text=self.t("saving"), state="disabled")
+            self.btn.config(text=self.t("saving"), state="disabled", style="Big.Accent.TButton")
             self.status.set(self.t("finishing"))
             threading.Thread(target=self._finish, args=(rec,), daemon=True).start()
             return
@@ -1693,8 +1872,9 @@ class App:
         except Exception as e:
             messagebox.showerror("Mito Recorder", str(e))
             return
-        self.btn.config(text=self.t("stop"))
-        self.issues, self.mon, self.unf_since = [], [], None
+        self.btn.config(text=self.t("stop"), style="Big.Danger.TButton")
+        self.issues, self.mon, self.unf_since, self.live = [], [], None, None
+        save_settings(self.settings())
 
     def _finish(self, rec):
         try:
@@ -1718,6 +1898,7 @@ class App:
             time.sleep(0.1)
         if self.raw:
             self.raw.stop()
+        save_settings(self.settings())
         self.root.destroy()
 
     def _on_raw(self, ev):  # Raw Input thread
@@ -1767,7 +1948,8 @@ class App:
         elif is_newer(val["tag"]):
             self.upd_info = val
             self.upd_status.set(self.t("upd_new", v=val["tag"].lstrip("v")))
-            self.upd_notes.config(text=(self.t("upd_notes") + "\n" + val["notes"]) if val["notes"] else "")
+            notes = [ln[:80] for ln in (val["notes"] or "").splitlines() if ln.strip()][:8]  # the window never scrolls
+            self.upd_notes.config(text=(self.t("upd_notes") + "\n" + "\n".join(notes)) if notes else "")
             self.upd_btn.state(["!disabled"])
             self.nb.tab(self.upd_tab, text=self.t("tab_update_new"))
         else:
@@ -1793,16 +1975,14 @@ class App:
             self.rec.note = "stopped early: the disk was almost full"
             self.toggle()
         if self.rec:
-            r, secs = self.rec, self.rec.t()
-            line = self.t("rec_line", mm=f"{int(secs // 60):02d}", ss=f"{int(secs % 60):02d}", name=r.out.name,
-                          fps=f"{r.frames / max(secs, 1e-6):.1f}", d=r.dropped)
-            if not r.focus:
-                line += self.t("not_focused")
-            if r.error:
-                line += self.t("err", err=r.error)
-            self.status.set(line)
+            r = self.rec
+            line = r.out.name + (self.t("not_focused") if not r.focus else "") + (self.t("err", err=r.error) if r.error else "")
+            if self._last.get("status") != line:
+                self._last["status"] = line
+                self.status.set(line)
         elif not self.busy and str(self.btn["state"]) == "disabled":
-            self.btn.config(text=self.t("start"), state="normal")
+            self.btn.config(text=self.t("start"), state="normal", style="Big.Accent.TButton")
+        self.render_live()
         now = time.perf_counter()
         if self.rec and now - self.last_mon >= 1:
             self.last_mon = now
@@ -1826,25 +2006,68 @@ class App:
              "silent_s": secs - (r.last_sound if r.last_sound is not None else 0) if r.audio and IS_WIN else 0,
              "idle_s": secs - (r.last_input if r.last_input is not None else 0) if r.focus else 0,
              "disk_low": shutil.disk_usage(r.out).free < 2 * LOW_FREE}
+        self.live = m
         self.issues = live_issues(m)
 
+    def render_live(self):
+        """Timer, state and chips of the live panel. Only touches a widget when its value changed."""
+        ui, pal, t, r = ui_theme, self.pal, self.t, self.rec
+        bad = {k for _, k in self.issues}
+        if r:
+            s = int(r.t())
+            timer = f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60:02d}:{s % 60:02d}"
+            state, dot = t("state_rec"), pal["danger"] if (self.blink_n // 3) % 2 == 0 else pal["border"]
+            m = self.live
+            fps = m["fps"] if m else None
+            chips = {
+                "fps": (t("chip_fps", n=f"{fps:.0f}" if m else "–", target=r.fps),
+                        "idle" if m is None else "bad" if fps < 0.6 * r.fps else "warn" if fps < 0.9 * r.fps else "ok"),
+                "drop": (t("chip_drop", n=r.dropped), "ok" if r.dropped == 0 else "warn"),
+                "focus": (t("chip_focus") if r.focus else t("chip_nofocus"), "ok" if r.focus else "warn"),
+                "sound": (t("chip_sound") if "sound" not in bad else t("chip_nosound"),
+                          "idle" if not r.audio else "warn" if "sound" in bad else "ok"),
+                "input": (t("chip_input") if "input" not in bad else t("chip_noinput"),
+                          "warn" if "input" in bad else "ok"),
+            }
+        else:
+            timer, state, dot = "00:00", t("state_saving") if self.busy else t("state_ready"), pal["accent"]
+            chips = {k: (t("idle_" + k), "idle") for k in self.chips}
+        for key, (text, st) in chips.items():
+            ui.set_chip(self.chips[key], pal, text, st)
+        for widget, text, kw in ((self.timer, timer, {"fg": pal["text"] if r else pal["muted"]}),
+                                 (self.state_lbl, state, {}), (self.dot, None, {"fg": dot})):
+            look = (text, tuple(kw.items()))
+            if self._last.get(id(widget)) != look:
+                self._last[id(widget)] = look
+                widget.config(**({"text": text} if text is not None else {}), **kw)
+
     def show_banner(self):
+        pal = self.pal
         if not self.issues:
-            self.banner.grid_remove()
+            if self._banner_on:  # back to the plain message
+                self.banner.pack_forget()
+                self.status_lbl.pack(fill="both", expand=True)
+                self._banner_on = False
             return
-        self.banner.grid()
-        color = "#c62828" if self.issues[0][0] == "high" else "#ef6c00"
+        if not self._banner_on:
+            self.status_lbl.pack_forget()
+            self.banner.pack(fill="both", expand=True)
+            self._banner_on = True
+        high = self.issues[0][0] == "high"
+        color, tint = (pal["danger"], pal["bad_bg"]) if high else (pal["warn"], pal["warn_bg"])
         on = (self.blink_n // 3) % 2 == 0  # ~0.6 s on/off
-        text = " · ".join(self.t("short_" + k) for _, k in self.issues) + "  " + self.t("banner_tail")
-        self.banner.config(text=text, bg=color if on else self.bg0, fg="white" if on else color)
+        text = "⚠  " + " · ".join(self.t("short_" + k) for _, k in self.issues) + "   " + self.t("banner_tail")
+        look = (text, color if on else tint, "#ffffff" if on else color)
+        if self._last.get("banner") != look:
+            self._last["banner"] = look
+            self.banner.config(text=text, bg=look[1], fg=look[2])
 
     def show_fix(self, key):
+        self.fix_var.set(key)
+        self._fix_key = key
+        self.help_var.set("fixes")
         self.nb.select(self.ins)
-        w = self.fix_labels[key]
-        bg0 = w.cget("bg")
-        w.config(bg="#fff176")  # flash the matching block for 2 s
-        self.root.after(2000, lambda: w.config(bg=bg0))
-
+        self._show_help()
 
 # ---------------------------------------------------------------- selftest / main
 
